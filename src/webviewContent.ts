@@ -3,53 +3,80 @@
  * Separated from chatPanel.ts for better maintainability
  */
 
-export function getWebviewHtml(): string {
-    return `<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>EasyCode Chat</title>
-    <style>
-        ${getStyles()}
-    </style>
-</head>
-<body>
-    <div class="header">
-        <div class="header-left">
-            <div class="model-selector">
-                <label for="model-select">Model</label>
-                <select id="model-select">
-                    <option value="">Loading models...</option>
-                </select>
-            </div>
-        </div>
-        <div class="status" id="status">Ready</div>
-    </div>
+import * as vscode from 'vscode';
+import * as fs from 'fs';
+import * as path from 'path';
 
-    <div class="chat-container" id="chat-container">
-        <div class="empty-state">
-            <h3>EasyCode Chat</h3>
-            <p>Start a conversation with your local AI assistant</p>
-        </div>
-    </div>
+export function getWebviewHtml(webview: vscode.Webview, extensionUri: vscode.Uri): string {
+    const styles = getStyles();
+    const script = getScript();
 
-    <div class="input-container">
-        <div class="input-wrapper">
-            <textarea 
-                id="message-input" 
-                placeholder="Type your message here... (Shift+Enter for new line)"
-                rows="1"
-            ></textarea>
-            <button id="send-button">Send</button>
-        </div>
-    </div>
+    // Write script to a file and use external script tag to avoid document.write() parsing issues
+    const scriptUri = writeScriptFile(webview, extensionUri, script);
 
-    <script>
-        ${getScript()}
-    </script>
-</body>
-</html>`;
+    // Build HTML using string concatenation to avoid template literal nesting issues
+    return '<!DOCTYPE html>\n' +
+        '<html lang="en">\n' +
+        '<head>\n' +
+        '    <meta charset="UTF-8">\n' +
+        '    <meta name="viewport" content="width=device-width, initial-scale=1.0">\n' +
+        '    <title>EasyCode Chat</title>\n' +
+        '    <style>\n' +
+        '        ' + styles + '\n' +
+        '    </style>\n' +
+        '</head>\n' +
+        '<body>\n' +
+        '    <div class="header">\n' +
+        '        <div class="header-left">\n' +
+        '            <div class="model-selector">\n' +
+        '                <label for="model-select">Model</label>\n' +
+        '                <select id="model-select">\n' +
+        '                    <option value="">Loading models...</option>\n' +
+        '                </select>\n' +
+        '            </div>\n' +
+        '        </div>\n' +
+        '        <div class="status" id="status">Ready</div>\n' +
+        '    </div>\n' +
+        '\n' +
+        '    <div class="chat-container" id="chat-container">\n' +
+        '        <div class="empty-state">\n' +
+        '            <h3>EasyCode Chat</h3>\n' +
+        '            <p>Start a conversation with your local AI assistant</p>\n' +
+        '        </div>\n' +
+        '    </div>\n' +
+        '\n' +
+        '    <div class="input-container">\n' +
+        '        <div class="input-wrapper">\n' +
+        '            <textarea \n' +
+        '                id="message-input" \n' +
+        '                placeholder="Type your message here... (Shift+Enter for new line)"\n' +
+        '                rows="1"\n' +
+        '            ></textarea>\n' +
+        '            <button id="send-button">Send</button>\n' +
+        '        </div>\n' +
+        '    </div>\n' +
+        '\n' +
+        '    <script src="' + scriptUri.toString() + '"></script>\n' +
+        '</body>\n' +
+        '</html>';
+}
+
+function writeScriptFile(webview: vscode.Webview, extensionUri: vscode.Uri, scriptContent: string): vscode.Uri {
+    // Create a script file in the extension's out directory
+    const scriptUri = vscode.Uri.joinPath(extensionUri, 'out', 'webview-script.js');
+    const scriptPath = scriptUri.fsPath;
+
+    // Ensure the directory exists
+    const scriptDir = path.dirname(scriptPath);
+    if (!fs.existsSync(scriptDir)) {
+        fs.mkdirSync(scriptDir, { recursive: true });
+    }
+
+    // Write the script content to the file
+    fs.writeFileSync(scriptPath, scriptContent, 'utf8');
+
+    // Return the webview URI for the script file
+    return webview.asWebviewUri(scriptUri);
 }
 
 function getStyles(): string {
@@ -539,41 +566,217 @@ button:disabled {
 }
 
 function getScript(): string {
-    return `const vscode = acquireVsCodeApi();
+    return String.raw`(function() {
+console.log('Webview: 🚀 Script starting...');
+const vscode = acquireVsCodeApi();
 const chatContainer = document.getElementById('chat-container');
 const messageInput = document.getElementById('message-input');
 const sendButton = document.getElementById('send-button');
 const modelSelect = document.getElementById('model-select');
 const status = document.getElementById('status');
 
+console.log('Webview: Elements found:', {
+    chatContainer: !!chatContainer,
+    messageInput: !!messageInput,
+    sendButton: !!sendButton,
+    modelSelect: !!modelSelect,
+    status: !!status
+});
+
 let conversationId = 'default';
 let currentModel = '';
 let isLoading = false;
 
-// Notify extension that webview is ready
+// Handle messages from extension - SET UP FIRST before sending webviewReady!
+console.log('Webview: Setting up message listener...');
+console.log('Webview: window.addEventListener exists?', typeof window.addEventListener);
+window.addEventListener('message', event => {
+    const message = event.data;
+    console.log('Webview: 📨📨📨 RECEIVED MESSAGE FROM EXTENSION! 📨📨📨');
+    console.log('Webview: Message command:', message.command);
+    console.log('Webview: Full message:', message);
+    console.log('Webview: Full event data:', JSON.stringify(event.data));
+    
+    // Ensure we have a valid message
+    if (!message || !message.command) {
+        console.warn('Webview: Received invalid message:', message);
+        return;
+    }
+    
+    switch (message.command) {
+        case 'addMessage':
+            addMessage(message.message);
+            break;
+        case 'models':
+            console.log('Webview: ✅✅✅ RECEIVED MODELS COMMAND! ✅✅✅');
+            console.log('Webview: Full message:', JSON.stringify(message));
+            console.log('Webview: Models array:', message.models);
+            console.log('Webview: Models array type:', typeof message.models, Array.isArray(message.models));
+            console.log('Webview: Current model:', message.currentModel);
+            console.log('Webview: Error:', message.error);
+            console.log('Webview: modelSelect element:', modelSelect);
+            console.log('Webview: modelSelect exists?', !!modelSelect);
+            
+            // Clear any loading timeout
+            if (window.modelsLoadingTimeout) {
+                clearTimeout(window.modelsLoadingTimeout);
+                window.modelsLoadingTimeout = null;
+                console.log('Webview: Cleared loading timeout');
+            }
+            
+            // Check if modelSelect exists
+            if (!modelSelect) {
+                console.error('Webview: ❌❌❌ modelSelect element not found!');
+                // Try to get it again
+                modelSelect = document.getElementById('model-select');
+                if (!modelSelect) {
+                    console.error('Webview: ❌ Still cannot find modelSelect after retry!');
+                    return;
+                }
+                console.log('Webview: ✅ Found modelSelect on retry');
+            }
+            
+            if (!message.models) {
+                console.error('Webview: Models message received but models array is undefined');
+                // Still show error message
+                modelSelect.innerHTML = '';
+                const errorOption = document.createElement('option');
+                errorOption.value = '';
+                errorOption.textContent = 'Error: No models data received';
+                modelSelect.appendChild(errorOption);
+                console.log('Webview: Added error option to dropdown');
+                break;
+            }
+            
+            // Clear existing options
+            console.log('Webview: Clearing modelSelect, current innerHTML:', modelSelect.innerHTML);
+            modelSelect.innerHTML = '';
+            console.log('Webview: Cleared modelSelect innerHTML, new innerHTML:', modelSelect.innerHTML);
+            
+            if (message.models.length > 0) {
+                console.log('Webview: Adding', message.models.length, 'models to dropdown');
+                message.models.forEach(function(model, index) {
+                    const option = document.createElement('option');
+                    option.value = model;
+                    option.textContent = model;
+                    modelSelect.appendChild(option);
+                    console.log('Webview: ✅ Added model option', index + 1, ':', model);
+                });
+                
+                console.log('Webview: Total options after adding:', modelSelect.options.length);
+                console.log('Webview: modelSelect.innerHTML after adding:', modelSelect.innerHTML);
+                
+                // Use currentModel from extension, or first model as fallback
+                currentModel = message.currentModel || message.models[0];
+                if (currentModel) {
+                    modelSelect.value = currentModel;
+                    console.log('Webview: ✅ Selected model:', currentModel);
+                    console.log('Webview: modelSelect.value after setting:', modelSelect.value);
+                    console.log('Webview: modelSelect.selectedIndex:', modelSelect.selectedIndex);
+                    // Notify extension of the selected model
+                    vscode.postMessage({
+                        command: 'setModel',
+                        model: currentModel
+                    });
+                } else {
+                    console.warn('Webview: No current model set, using first model');
+                    currentModel = message.models[0];
+                    modelSelect.value = currentModel;
+                    vscode.postMessage({
+                        command: 'setModel',
+                        model: currentModel
+                    });
+                }
+                
+                // Force a visual update
+                console.log('Webview: Final modelSelect state:');
+                console.log('  - innerHTML:', modelSelect.innerHTML);
+                console.log('  - value:', modelSelect.value);
+                console.log('  - selectedIndex:', modelSelect.selectedIndex);
+                console.log('  - options.length:', modelSelect.options.length);
+            } else {
+                console.warn('Webview: No models available');
+                const option = document.createElement('option');
+                option.value = '';
+                // Show error message if provided, otherwise generic message
+                if (message.error) {
+                    // Truncate long error messages
+                    const shortError = message.error.length > 60 
+                        ? message.error.substring(0, 57) + '...' 
+                        : message.error;
+                    option.textContent = 'Error: ' + shortError;
+                } else {
+                    option.textContent = 'No models found - check Ollama is running';
+                }
+                modelSelect.appendChild(option);
+                console.log('Webview: Added empty models option');
+            }
+            console.log('Webview: ✅✅✅ FINISHED PROCESSING MODELS COMMAND ✅✅✅');
+            break;
+        case 'error':
+            setLoading(false);
+            status.textContent = 'Error: ' + message.message;
+            break;
+        case 'status':
+            // Update status without changing loading state
+            const statusText = message.message || 'Ready';
+            status.textContent = statusText;
+            console.log('Webview: Status updated to:', statusText);
+            if (statusText.toLowerCase().includes('thinking') || statusText.toLowerCase().includes('processing')) {
+                status.className = 'status thinking';
+            } else {
+                status.className = 'status';
+            }
+            break;
+        case 'ollamaUrl':
+            status.textContent = 'Connected to ' + message.url;
+            break;
+    }
+});
+console.log('Webview: ✅ Message listener set up');
+
+// Notify extension that webview is ready - AFTER message listener is set up!
+console.log('Webview: 📢 Sending webviewReady message');
+console.log('Webview: modelSelect element exists:', !!modelSelect);
+console.log('Webview: modelSelect element:', modelSelect);
+console.log('Webview: modelSelect.innerHTML:', modelSelect ? modelSelect.innerHTML : 'N/A');
+
+// Verify message listener is actually set up
+console.log('Webview: Message listener registered:', typeof window.addEventListener === 'function');
+
 vscode.postMessage({ command: 'webviewReady' });
+console.log('Webview: ✅ webviewReady message sent');
+
+// Add a fallback: if no models received after 3 seconds, try to manually update
+setTimeout(() => {
+    const firstOption = modelSelect.options[0];
+    if (firstOption && firstOption.textContent === 'Loading models...') {
+        console.warn('Webview: ⚠️ Fallback triggered - no models received after 3 seconds');
+        console.warn('Webview: Attempting to request models again...');
+        vscode.postMessage({ command: 'getModels' });
+    }
+}, 3000);
 
 // Request Ollama URL on load
 vscode.postMessage({ command: 'getOllamaUrl' });
 
 // Request models on load (extension will load them automatically, but request as backup)
+console.log('Webview: Requesting models via getModels command');
 vscode.postMessage({ command: 'getModels' });
 
-// If models still not loaded after delay, request again
-setTimeout(() => {
-    if (modelSelect.options.length === 1 && modelSelect.options[0].value === '') {
-        console.log('Models not loaded, requesting again...');
-        vscode.postMessage({ command: 'getModels' });
+// Set a timeout to show error if no response after 5 seconds
+window.modelsLoadingTimeout = setTimeout(() => {
+    console.warn('Webview: Timeout waiting for models response');
+    // Check if still showing "Loading models..."
+    const firstOption = modelSelect.options[0];
+    if (firstOption && firstOption.textContent === 'Loading models...') {
+        modelSelect.innerHTML = '';
+        const errorOption = document.createElement('option');
+        errorOption.value = '';
+        errorOption.textContent = 'Error: Timeout loading models - check Ollama is running';
+        modelSelect.appendChild(errorOption);
     }
-}, 1000);
-
-// Another retry after 2 seconds
-setTimeout(() => {
-    if (modelSelect.options.length === 1 && modelSelect.options[0].value === '') {
-        console.log('Models still not loaded, final request...');
-        vscode.postMessage({ command: 'getModels' });
-    }
-}, 2000);
+}, 5000);
 
 // Auto-resize textarea
 messageInput.addEventListener('input', function() {
@@ -654,7 +857,7 @@ function addMessage(message) {
     }
     
     const messageDiv = document.createElement('div');
-    messageDiv.className = \`message \${message.role}\`;
+    messageDiv.className = 'message ' + message.role;
     
     const avatar = document.createElement('div');
     avatar.className = 'message-avatar';
@@ -690,10 +893,21 @@ function addMessage(message) {
     const codeBlockPlaceholders = [];
     
     // Step 1: Extract and protect code blocks (triple backtick + lang + newline + code + newline + triple backtick)
-    // Use String.fromCharCode to avoid template string issues
+    // Use a simpler approach: match code blocks using a regex that doesn't require complex escaping
+    // Since we're in a template string, we need to be careful with backticks
+    // Declare these once at the top of the function to avoid duplicate declarations
     const backtickChar = String.fromCharCode(96);
-    const tripleBacktick = backtickChar + backtickChar + backtickChar;
-    const codeBlockPattern = tripleBacktick + '(\\\\w+)?\\\\n([\\\\s\\\\S]*?)\\\\n' + tripleBacktick;
+    // For regex pattern, we need escaped backtick to match a literal backtick
+    // We construct this using String.fromCharCode to avoid template string issues
+    const backslash = String.fromCharCode(92);
+    const escapedBacktick = backslash + backtickChar;
+    const tripleEscapedBacktick = escapedBacktick + escapedBacktick + escapedBacktick;
+    // Pattern: triple backtick + optional lang + newline + code + newline + triple backtick
+    // We need to escape backslashes in the pattern string so they become literal backslashes in the regex
+    // For w, we need double-backslash-w within the string (becomes single-backslash-w within regex)
+    // For n, we need double-backslash-n within the string (becomes single-backslash-n within regex)
+    // For s and S, we need double-backslash-s and double-backslash-S within the string
+    const codeBlockPattern = tripleEscapedBacktick + '(\\\\w+)?\\\\n([\\\\s\\\\S]*?)\\\\n' + tripleEscapedBacktick;
     const codeBlockRegex = new RegExp(codeBlockPattern, 'g');
     formattedContent = formattedContent.replace(codeBlockRegex, function(match, lang, code) {
         // Escape HTML in code content
@@ -716,16 +930,31 @@ function addMessage(message) {
     // Step 3: Handle markdown lists (only process if not inside code blocks)
     formattedContent = formattedContent.replace(/^[\*\-] (.+)$/gm, '<li>$1</li>');
     // Wrap consecutive list items in <ul>
-    formattedContent = formattedContent.replace(/(<li>.*?<\/li>(?:\\n|\\r\\n|\\n\\r)?)+/g, function(match) {
-        return '<ul>' + match.replace(/\\n|\\r\\n|\\n\\r/g, '') + '</ul>';
+    // Use RegExp constructor to avoid backslash escaping issues
+    const listItemPattern = new RegExp('(<li>.*?</li>(?:\\n|\\r\\n|\\n\\r)?)+', 'g');
+    formattedContent = formattedContent.replace(listItemPattern, function(match) {
+        const newlinePattern = new RegExp('\\n|\\r\\n|\\n\\r', 'g');
+        return '<ul>' + match.replace(newlinePattern, '') + '</ul>';
     });
     
     // Step 4: Handle markdown bold and italic
     formattedContent = formattedContent.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-    formattedContent = formattedContent.replace(/\*(.+?)\*/g, '<em>$1</em>');
+    // Use RegExp constructor to avoid comment parsing issues with /* pattern
+    const italicPattern = new RegExp('\\*(.+?)\\*', 'g');
+    formattedContent = formattedContent.replace(italicPattern, '<em>$1</em>');
     
     // Step 5: Handle inline code (but not inside code blocks)
-    const inlineCodePattern = backtickChar + '([^' + backtickChar + ']+)' + backtickChar;
+    // Use a simpler regex that matches backtick-wrapped content
+    // We'll match the pattern: backtick + content + backtick
+    // Since we're in a template string, we construct the pattern carefully
+    // Reuse backslash and backtickChar declared above
+    // Escape backtick for use outside character class
+    const escapedBacktickInline = backslash + backtickChar;
+    // For character class [^X], we can use the backtick directly (no escape needed in char class)
+    // Store it in a variable to avoid issues with template string
+    const charClassBacktick = backtickChar;
+    // Pattern matches: escaped backtick, then [^backtick]+, then escaped backtick
+    const inlineCodePattern = escapedBacktickInline + '([^' + charClassBacktick + ']+)' + escapedBacktickInline;
     const inlineCodeRegex = new RegExp(inlineCodePattern, 'g');
     formattedContent = formattedContent.replace(inlineCodeRegex, '<code>$1</code>');
     
@@ -751,24 +980,35 @@ function addMessage(message) {
     
     // Step 8: Convert newlines to <br> (but not inside code blocks or HTML tags)
     // Split by code blocks and HTML tags first
-    const textParts = formattedContent.split(/(<pre>[\s\S]*?<\/pre>|<[^>]+>)/g);
+    // Need 4 backslashes because String.raw doesn't affect interpolated expressions
+    const textPartsPattern = new RegExp('(<pre>[\\\\s\\\\S]*?</pre>|<[^>]+>)', 'g');
+    const textParts = formattedContent.split(textPartsPattern);
+    // Use RegExp constructor for match patterns
+    // Need 4 backslashes because String.raw doesn't affect interpolated expressions
+    const prePattern = new RegExp('^<pre>[\\\\s\\\\S]*</pre>$');
+    const htmlTagPattern = new RegExp('^<[^>]+>$');
+    const escapedNewline = new RegExp('\\\\\\\\n', 'g');
+    const actualNewline = new RegExp('\\\\n', 'g');
     formattedContent = textParts.map(function(part) {
         // Don't process code blocks or HTML tags
-        if (part.match(/^<pre>[\s\S]*<\/pre>$/) || part.match(/^<[^>]+>$/)) {
+        if (part.match(prePattern) || part.match(htmlTagPattern)) {
             return part;
         }
-        // Convert actual newlines to <br> in text parts (not escaped \n)
-        return part.replace(/\\n/g, '<br>').replace(/\n/g, '<br>');
+        // Convert actual newlines to <br> in text parts (not escaped backslash-n)
+        return part.replace(escapedNewline, '<br>').replace(actualNewline, '<br>');
     }).join('');
     
     // Step 9: Clean up multiple consecutive <br> tags (but preserve code blocks)
-    formattedContent = formattedContent.replace(/(<br>\s*){3,}/g, '<br><br>');
+    // Need 4 backslashes because String.raw doesn't affect interpolated expressions
+    const multipleBrPattern = new RegExp('(<br>\\\\s*){3,}', 'g');
+    formattedContent = formattedContent.replace(multipleBrPattern, '<br><br>');
     
     // Step 10: Wrap text blocks in paragraphs (but not code blocks, lists, headers, or divs)
-    const textBlockRegex = /(?:^|<br>)([^<]+?)(?:<br>|$)/g;
+    const textBlockRegex = new RegExp('(?:^|<br>)([^<]+?)(?:<br>|$)', 'g');
+    const whitespaceOnlyPattern = new RegExp('^[\\\\s\\\\n]*$');
     formattedContent = formattedContent.replace(textBlockRegex, function(match, text) {
         text = text.trim();
-        if (text && !text.match(/^[\s\n]*$/)) {
+        if (text && !text.match(whitespaceOnlyPattern)) {
             // Don't wrap if it's already inside a tag or is just whitespace
             return match.replace(text, '<p>' + text + '</p>');
         }
@@ -857,65 +1097,7 @@ modelSelect.addEventListener('change', function() {
     });
 });
 
-// Handle messages from extension
-window.addEventListener('message', event => {
-    const message = event.data;
-    
-    switch (message.command) {
-        case 'addMessage':
-            addMessage(message.message);
-            break;
-        case 'models':
-            console.log('Received models:', message.models);
-            if (!message.models) {
-                console.error('Models message received but models array is undefined');
-                break;
-            }
-            modelSelect.innerHTML = '';
-            if (message.models.length > 0) {
-                message.models.forEach(function(model) {
-                    const option = document.createElement('option');
-                    option.value = model;
-                    option.textContent = model;
-                    modelSelect.appendChild(option);
-                });
-                // Use currentModel from extension, or first model as fallback
-                currentModel = message.currentModel || message.models[0];
-                if (currentModel) {
-                    modelSelect.value = currentModel;
-                    console.log('Selected model:', currentModel);
-                    // Notify extension of the selected model
-                    vscode.postMessage({
-                        command: 'setModel',
-                        model: currentModel
-                    });
-                }
-            } else {
-                const option = document.createElement('option');
-                option.value = '';
-                option.textContent = 'No models found - check Ollama is running';
-                modelSelect.appendChild(option);
-                console.log('No models available');
-            }
-            break;
-        case 'error':
-            setLoading(false);
-            status.textContent = \`Error: \${message.message}\`;
-            break;
-        case 'status':
-            // Update status without changing loading state
-            const statusText = message.message || 'Ready';
-            status.textContent = statusText;
-            if (statusText.toLowerCase().includes('thinking') || statusText.toLowerCase().includes('processing')) {
-                status.className = 'status thinking';
-            } else {
-                status.className = 'status';
-            }
-            break;
-        case 'ollamaUrl':
-            status.textContent = \`Connected to \${message.url}\`;
-            break;
-    }
-});`;
+console.log('Webview: ✅ Script fully loaded and initialized');
+})();`;
 }
 

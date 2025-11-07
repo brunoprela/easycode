@@ -47,6 +47,9 @@ export class ChatPanel {
         // Handle messages from the webview
         this._panel.webview.onDidReceiveMessage(
             async (message) => {
+                console.log('ChatPanel: 📨📨📨 RECEIVED MESSAGE FROM WEBVIEW! 📨📨📨');
+                console.log('ChatPanel: Message command:', message.command);
+                console.log('ChatPanel: Full message:', JSON.stringify(message));
                 // Special handling for sendMessage (needs access to orchestrators)
                 if (message.command === 'sendMessage') {
                     await this._handleSendMessage(message.text, message.conversationId);
@@ -67,20 +70,40 @@ export class ChatPanel {
         // The webview will send 'webviewReady' message when it's ready
         // We also try loading models when the panel becomes visible
         this._panel.onDidChangeViewState(() => {
-            // Webview is now visible, safe to send messages
             if (this._panel.visible) {
-                // Small delay to ensure webview is fully initialized
+                console.log('ChatPanel: Panel became visible, loading models...');
+                // Don't reload HTML here - it resets the webview state
+                // Just load models - the webview should already be set up
                 setTimeout(() => {
-                    this._messageHandlers.handleGetModels();
-                }, 100);
+                    this._messageHandlers.handleGetModels().catch(err => {
+                        console.error('ChatPanel: Error loading models on visibility change:', err);
+                    });
+                }, 500);
             }
         }, null, this._disposables);
 
         // Also try immediately (in case webview is already visible)
-        // Use a longer delay to ensure webview is ready
+        // Try multiple times with increasing delays to ensure webview is ready
         setTimeout(() => {
-            this._messageHandlers.handleGetModels();
-        }, 500);
+            console.log('ChatPanel: Initial model load attempt (300ms)');
+            this._messageHandlers.handleGetModels().catch(err => {
+                console.error('ChatPanel: Error in initial model load:', err);
+            });
+        }, 300);
+
+        setTimeout(() => {
+            console.log('ChatPanel: Second model load attempt (1000ms)');
+            this._messageHandlers.handleGetModels().catch(err => {
+                console.error('ChatPanel: Error in second model load:', err);
+            });
+        }, 1000);
+
+        setTimeout(() => {
+            console.log('ChatPanel: Third model load attempt (2000ms)');
+            this._messageHandlers.handleGetModels().catch(err => {
+                console.error('ChatPanel: Error in third model load:', err);
+            });
+        }, 2000);
     }
 
     public reveal() {
@@ -514,6 +537,6 @@ REMEMBER:
     }
 
     private _getHtmlForWebview(webview: vscode.Webview) {
-        return getWebviewHtml();
+        return getWebviewHtml(webview, this._extensionUri);
     }
 }

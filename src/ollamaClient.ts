@@ -69,21 +69,54 @@ export async function getAIResponse(
  */
 export async function getModels(ollamaUrl: string): Promise<string[]> {
     try {
+        console.log(`OllamaClient: Fetching models from ${ollamaUrl}/api/tags`);
         const response = await axios.get(`${ollamaUrl}/api/tags`, {
-            timeout: 5000,
+            timeout: 10000, // Increased timeout to 10 seconds
             validateStatus: (status) => status < 500
         });
+
+        console.log(`OllamaClient: Response status: ${response.status}`);
+        console.log(`OllamaClient: Response data:`, JSON.stringify(response.data).substring(0, 200));
 
         if (response.status === 404) {
             throw new Error(`Ollama API endpoint not found. Make sure Ollama is running at ${ollamaUrl}`);
         }
 
-        if (!response.data || !response.data.models) {
-            throw new Error('Invalid response from Ollama API');
+        if (!response.data) {
+            throw new Error('Empty response from Ollama API');
         }
 
-        return response.data.models.map((m: any) => m.name);
+        if (!response.data.models) {
+            console.warn('OllamaClient: Response missing models array:', response.data);
+            throw new Error('Invalid response from Ollama API: missing models array');
+        }
+
+        if (!Array.isArray(response.data.models)) {
+            console.warn('OllamaClient: Models is not an array:', response.data.models);
+            throw new Error('Invalid response from Ollama API: models is not an array');
+        }
+
+        // Extract model names - use 'name' field, fallback to 'model' field
+        const modelNames = response.data.models.map((m: any) => {
+            const name = m.name || m.model || '';
+            if (!name) {
+                console.warn('OllamaClient: Model entry missing name:', m);
+            }
+            return name;
+        }).filter((name: string) => name.length > 0);
+
+        console.log(`OllamaClient: Extracted ${modelNames.length} models:`, modelNames);
+        return modelNames;
     } catch (error: any) {
+        console.error('OllamaClient: Error fetching models:', error);
+        console.error('OllamaClient: Error details:', {
+            message: error.message,
+            code: error.code,
+            status: error.response?.status,
+            statusText: error.response?.statusText,
+            data: error.response?.data
+        });
+
         if (error.response?.status === 404) {
             throw new Error(`Ollama API not found at ${ollamaUrl}. Make sure Ollama is running. Install from https://ollama.ai if needed.`);
         } else if (error.code === 'ECONNREFUSED') {
@@ -92,6 +125,8 @@ export async function getModels(ollamaUrl: string): Promise<string[]> {
             throw new Error(`Cannot resolve host for ${ollamaUrl}. Check your Ollama URL in settings.`);
         } else if (error.code === 'ETIMEDOUT' || error.message.includes('timeout')) {
             throw new Error(`Connection to Ollama timed out. Make sure Ollama is running at ${ollamaUrl}.`);
+        } else if (error.response?.status >= 400) {
+            throw new Error(`Ollama API returned error ${error.response.status}: ${error.response.data?.error || error.message}`);
         }
         throw error;
     }
