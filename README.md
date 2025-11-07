@@ -27,11 +27,11 @@ A VSCode extension that brings a Cursor-like chat interface powered by local AI 
 1. Clone this repository
 2. Install dependencies:
    ```bash
-   pnpm install
+   npm install
    ```
 3. Compile the extension:
    ```bash
-   pnpm run compile
+   npm run compile
    ```
 4. Press `F5` in VS Code to open a new Extension Development Host window
 5. In the new window, press `Ctrl+Shift+L` (or `Cmd+Shift+L` on Mac) to open the chat panel
@@ -62,23 +62,23 @@ You can configure the Ollama URL in VS Code settings:
 
 ```bash
 # Install dependencies
-pnpm install
+npm install
 
 # Compile TypeScript
-pnpm run compile
+npm run compile
 
 # Watch mode (auto-compile on changes)
-pnpm run watch
+npm run watch
 
 # Lint
-pnpm run lint
+npm run lint
 ```
 
 ## Requirements
 
 - VS Code 1.74.0 or higher
 - Node.js 18.x or higher
-- pnpm 8.x or higher
+- npm 10.x or higher
 - Ollama running locally
 
 ## License

@@ -1,9 +1,14 @@
 {
-  "name": "easycode",
+  "name": "easycode-ai",
   "displayName": "EasyCode - Local AI Chat",
   "description": "AI chat assistant powered by local models (similar to Cursor)",
   "version": "0.0.1",
-  "packageManager": "pnpm@8.0.0",
+  "publisher": "brunoprela",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/brunoprela/easycode"
+  },
+  "packageManager": "npm@10.9.0",
   "engines": {
     "vscode": "^1.74.0"
   },
@@ -41,10 +46,10 @@
     ]
   },
   "scripts": {
-    "vscode:prepublish": "pnpm run compile",
+    "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "pretest": "pnpm run compile && pnpm run lint",
+    "pretest": "npm run compile && npm run lint",
     "lint": "eslint src --ext ts",
     "test": "node ./out/test/runTest.js"
   },
