@@ -5,6 +5,7 @@ import { getAIResponse } from '../ollamaClient';
 import { buildReActSystemMessage, buildFrameworkGuidancePrompt, buildContextPrompt } from './reactPrompts';
 import { thinkPhase, actPhase, verifyPhase } from './reactPhases';
 import { extractGenericAction, isTaskAlreadyComplete, checkIfTaskComplete } from './reactHelpers';
+import { MCPToolAdapter } from './mcpToolAdapter';
 
 // Extended interfaces specific to ReActOrchestrator
 export interface ExtendedReActState extends ReActState {
@@ -18,12 +19,17 @@ export interface ExtendedCodebaseState extends CodebaseState {
 
 export class ReActOrchestrator {
     private mcpTools: MCPTools;
+    private toolAdapter: MCPToolAdapter;
     private state: ReActState;
-    private maxReasoningSteps: number = 50;
+    private maxReasoningSteps: number = 30; // Reduced from 50 to prevent long loops
     private verificationEnabled: boolean = true;
+    private recentActions: Array<{ action: string; timestamp: number }> = []; // Track recent actions
+    private consecutiveFailures: number = 0;
+    private maxConsecutiveFailures: number = 3;
 
     constructor(mcpTools: MCPTools) {
         this.mcpTools = mcpTools;
+        this.toolAdapter = new MCPToolAdapter(mcpTools);
         this.state = {
             task: '',
             reasoning: [],
@@ -62,10 +68,39 @@ export class ReActOrchestrator {
         let stepCount = 0;
         let consecutiveThinks = 0;
         const maxConsecutiveThinks = 3; // Force action after 3 consecutive thinks
+        const startTime = Date.now();
+        const maxExecutionTime = 5 * 60 * 1000; // 5 minutes max execution time
 
         while (stepCount < this.maxReasoningSteps) {
             stepCount++;
+            
+            // Check for timeout
+            if (Date.now() - startTime > maxExecutionTime) {
+                onMessage('system', '⏱️ Maximum execution time reached. Stopping to prevent timeout.');
+                break;
+            }
+            
             onProgress(`ReAct Step ${stepCount}/${this.maxReasoningSteps}`);
+            
+            // Check for repeated actions (detect loops)
+            if (this.detectActionLoop()) {
+                onMessage('system', '⚠️ Detected action loop - same actions being repeated. Stopping to prevent infinite loop.');
+                onMessage('assistant', 'I detected that I was repeating the same actions. Let me check if the task is already complete or try a different approach.');
+                
+                // Check if task is actually complete
+                const completionCheck = await this.checkTaskCompletion(task, onMessage);
+                if (completionCheck.complete) {
+                    onMessage('assistant', completionCheck.summary || 'Task appears to be complete!');
+                    break;
+                }
+                
+                // Try to break out of loop with explicit instruction
+                messages.push({
+                    role: 'user',
+                    content: 'You are repeating the same actions. Please either: 1) Check if the task is complete, 2) Try a completely different approach, or 3) Explain what is blocking progress.'
+                });
+                continue;
+            }
 
             try {
                 // Phase 1: THINK - AI reasons about what to do
@@ -100,8 +135,30 @@ export class ReActOrchestrator {
 
                 // Phase 2: ACT - Execute action if needed (Cursor-like: natural and conversational)
                 if (reasoning.action) {
+                    // Track action to detect loops
+                    const actionKey = this.getActionKey(reasoning.action);
+                    this.recentActions.push({ action: actionKey, timestamp: Date.now() });
+                    // Keep only last 10 actions
+                    if (this.recentActions.length > 10) {
+                        this.recentActions.shift();
+                    }
+                    
                     const result = await this.actPhase(reasoning.action, onProgress, onToolExecution);
                     reasoning.observation = result.success ? (result.content || '') : (result.error || 'Unknown error');
+                    
+                    // Track consecutive failures
+                    if (result.success) {
+                        this.consecutiveFailures = 0;
+                    } else {
+                        this.consecutiveFailures++;
+                    }
+                    
+                    // Stop if too many consecutive failures
+                    if (this.consecutiveFailures >= this.maxConsecutiveFailures) {
+                        onMessage('system', `⚠️ ${this.maxConsecutiveFailures} consecutive failures. Stopping to prevent further errors.`);
+                        onMessage('assistant', 'I encountered multiple failures. The task may be blocked or require manual intervention.');
+                        break;
+                    }
 
                     // Cursor-like: Show what happened naturally
                     if (result.success) {
@@ -124,19 +181,37 @@ export class ReActOrchestrator {
                         onMessage('system', `⚠️ ${reasoning.action.name} failed: ${result.error || 'Unknown error'}`);
                     }
 
-                    // Handle "already exists" errors gracefully - continue with task
+                    // Handle "already exists" errors gracefully - advance task instead of looping
                     if (!result.success && reasoning.action.name === 'run_command') {
                         const errorMsg = (result.error || result.content || '').toLowerCase();
-                        // If it's just a "file/directory exists" error, treat it as success and continue
+                        // If it's just a "file/directory exists" error, treat it as success and advance
                         if (errorMsg.includes('file exists') || 
                             errorMsg.includes('directory exists') ||
                             errorMsg.includes('already exists') ||
                             (errorMsg.includes('exists') && errorMsg.includes('mkdir'))) {
                             onMessage('system', `ℹ️ ${reasoning.action.arguments.command} - already exists, continuing...`);
                             reasoning.observation = 'Directory/file already exists, continuing with setup';
+                            
+                            // Check what the next logical step should be based on the task
+                            const cmd = (reasoning.action.arguments.command || '').toLowerCase();
+                            let nextStepPrompt = '';
+                            
+                            if (cmd.includes('mkdir') && cmd.includes('backend')) {
+                                // Directory created, next should be setup (venv, install, create files)
+                                nextStepPrompt = 'The backend directory already exists. Now proceed with: 1) Creating virtual environment if it doesn\'t exist, 2) Installing packages (fastapi, uvicorn), 3) Creating main.py and requirements.txt files. Skip directory creation and move to the next step.';
+                            } else if (cmd.includes('venv') || cmd.includes('virtualenv')) {
+                                // Venv exists, next should be install packages
+                                nextStepPrompt = 'Virtual environment already exists. Proceed with installing packages (pip install fastapi uvicorn) and creating the application files.';
+                            } else if (cmd.includes('pip install')) {
+                                // Packages installed, next should be create files
+                                nextStepPrompt = 'Packages are already installed. Now create the FastAPI application files (main.py, requirements.txt).';
+                            } else {
+                                nextStepPrompt = 'That step is already complete. Continue with the next logical step in the setup process.';
+                            }
+                            
                             messages.push({
                                 role: 'user',
-                                content: 'That directory already exists. Continue with the rest of the setup (virtual environment, installing packages, creating files, etc.).'
+                                content: nextStepPrompt
                             });
                             continue;
                         }
@@ -203,6 +278,15 @@ export class ReActOrchestrator {
                             content: 'What would you like to do next? Use tools to make progress on the task.'
                         });
                         continue;
+                    }
+                }
+
+                // Periodic completion check (every 5 steps or on completion signal)
+                if (stepCount % 5 === 0 || reasoning.next === 'complete') {
+                    const completionCheck = await this.checkTaskCompletion(task, onMessage);
+                    if (completionCheck.complete) {
+                        onMessage('assistant', completionCheck.summary || 'Task appears to be complete!');
+                        break;
                     }
                 }
 
@@ -500,6 +584,82 @@ Analyze what went wrong and suggest a correction. What should be done differentl
      * Check if task is already complete
      * Supports generic Python and TypeScript project detection
      */
+    /**
+     * Detect if we're in an action loop (repeating the same actions)
+     */
+    private detectActionLoop(): boolean {
+        if (this.recentActions.length < 4) {
+            return false; // Need at least 4 actions to detect a loop
+        }
+        
+        // Check if last 3 actions are the same
+        const lastThree = this.recentActions.slice(-3).map(a => a.action);
+        const allSame = lastThree.every(a => a === lastThree[0]);
+        
+        if (allSame) {
+            return true;
+        }
+        
+        // Check for pattern: A -> B -> A -> B (alternating loop)
+        if (this.recentActions.length >= 4) {
+            const lastFour = this.recentActions.slice(-4).map(a => a.action);
+            if (lastFour[0] === lastFour[2] && lastFour[1] === lastFour[3] && lastFour[0] !== lastFour[1]) {
+                return true;
+            }
+        }
+        
+        return false;
+    }
+
+    /**
+     * Get a unique key for an action to track repetitions
+     */
+    private getActionKey(action: ToolCall): string {
+        if (action.name === 'run_command') {
+            // Normalize command by removing variable parts
+            const cmd = action.arguments.command || '';
+            // Remove timestamps, random strings, etc.
+            const normalized = cmd
+                .replace(/\d{4}-\d{2}-\d{2}/g, 'DATE')
+                .replace(/\d{2}:\d{2}:\d{2}/g, 'TIME')
+                .replace(/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}/gi, 'UUID')
+                .trim();
+            return `run_command:${normalized.substring(0, 100)}`;
+        }
+        return `${action.name}:${JSON.stringify(action.arguments).substring(0, 100)}`;
+    }
+
+    /**
+     * Check if task is complete by examining the codebase
+     */
+    private async checkTaskCompletion(task: string, onMessage: (role: string, content: string) => void): Promise<{ complete: boolean; summary?: string }> {
+        const lowerTask = task.toLowerCase();
+        
+        // Use the helper function from reactHelpers
+        const workspaceFolders = vscode.workspace.workspaceFolders;
+        const workspaceRoot = workspaceFolders?.[0]?.uri.fsPath || process.cwd();
+        const isComplete = await checkIfTaskComplete(task, workspaceRoot);
+        
+        if (isComplete) {
+            // Generate a summary
+            let summary = 'Task appears to be complete! ';
+            
+            if (lowerTask.includes('fastapi')) {
+                summary += 'FastAPI backend structure detected (main.py and requirements.txt exist).';
+            } else if (lowerTask.includes('next.js') || lowerTask.includes('nextjs')) {
+                summary += 'Next.js project structure detected.';
+            } else if (lowerTask.includes('react')) {
+                summary += 'React project structure detected.';
+            } else {
+                summary += 'Required files and structure are in place.';
+            }
+            
+            return { complete: true, summary };
+        }
+        
+        return { complete: false };
+    }
+
     private async checkIfTaskComplete(
         task: string
     ): Promise<boolean> {
@@ -989,7 +1149,7 @@ Remember: You're a coding assistant, not a robot. Be natural, helpful, and code-
 Recent file changes:
 ${Array.from(this.state.codebaseState.filesModified).slice(-5).join(', ')}
 
-Available tools: ${this.mcpTools.getAvailableTools().split('\n').slice(0, 10).join('\n')}`;
+Available tools: ${this.toolAdapter.getToolsDescription().split('\n').slice(0, 20).join('\n')}`;
     }
 
     /**

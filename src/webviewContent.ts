@@ -607,6 +607,9 @@ window.addEventListener('message', event => {
         case 'addMessage':
             addMessage(message.message);
             break;
+        case 'updateLastAssistantMessage':
+            updateLastAssistantMessage(message.content);
+            break;
         case 'models':
             console.log('Webview: ✅✅✅ RECEIVED MODELS COMMAND! ✅✅✅');
             console.log('Webview: Full message:', JSON.stringify(message));
@@ -849,11 +852,88 @@ function setLoading(loading) {
     }
 }
 
+function updateLastAssistantMessage(content) {
+    // Find the last assistant message
+    const messages = chatContainer.querySelectorAll('.message.assistant');
+    if (messages.length > 0) {
+        const lastMessage = messages[messages.length - 1];
+        const contentDiv = lastMessage.querySelector('.message-content');
+        if (contentDiv) {
+            // Format and update the content
+            const formatted = formatMessageContent(content);
+            contentDiv.innerHTML = formatted;
+            // Scroll to bottom
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+    } else {
+        // No assistant message yet, create one
+        addMessage({ role: 'assistant', content: content });
+    }
+}
+
+function formatMessageContent(content) {
+    // Same formatting logic as in addMessage, but just return the formatted HTML
+    let formattedContent = String(content || '');
+    const codeBlockPlaceholders = [];
+    const backtickChar = String.fromCharCode(96);
+    const backslash = String.fromCharCode(92);
+    const escapedBacktick = backslash + backtickChar;
+    const tripleEscapedBacktick = escapedBacktick + escapedBacktick + escapedBacktick;
+    const codeBlockPattern = tripleEscapedBacktick + '(\\\\w+)?\\\\n([\\\\s\\\\S]*?)\\\\n' + tripleEscapedBacktick;
+    const codeBlockRegex = new RegExp(codeBlockPattern, 'g');
+    formattedContent = formattedContent.replace(codeBlockRegex, function(match, lang, code) {
+        const escapedCode = code
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+        const placeholder = '__CODE_BLOCK_' + codeBlockPlaceholders.length + '__';
+        codeBlockPlaceholders.push('<pre><code' + (lang ? ' class="language-' + lang + '"' : '') + '>' + escapedCode + '</code></pre>');
+        return placeholder;
+    });
+    
+    formattedContent = formattedContent.replace(/^### (.*)$/gm, '<h3>$1</h3>');
+    formattedContent = formattedContent.replace(/^## (.*)$/gm, '<h2>$1</h2>');
+    formattedContent = formattedContent.replace(/^# (.*)$/gm, '<h1>$1</h1>');
+    
+    formattedContent = formattedContent.replace(/^[\*\-] (.+)$/gm, '<li>$1</li>');
+    const listItemPattern = new RegExp('(<li>.*?</li>(?:\\n|\\r\\n|\\n\\r)?)+', 'g');
+    formattedContent = formattedContent.replace(listItemPattern, function(match) {
+        const newlinePattern = new RegExp('\\n|\\r\\n|\\n\\r', 'g');
+        return '<ul>' + match.replace(newlinePattern, '') + '</ul>';
+    });
+    
+    formattedContent = formattedContent.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+    const italicPattern = new RegExp('\\*(.+?)\\*', 'g');
+    formattedContent = formattedContent.replace(italicPattern, '<em>$1</em>');
+    
+    // Restore code blocks
+    codeBlockPlaceholders.forEach(function(block, index) {
+        formattedContent = formattedContent.replace('__CODE_BLOCK_' + index + '__', block);
+    });
+    
+    // Convert newlines to <br>
+    formattedContent = formattedContent.replace(/\n/g, '<br>');
+    
+    return formattedContent;
+}
+
 function addMessage(message) {
     // Remove empty state if it exists
     const emptyState = chatContainer.querySelector('.empty-state');
     if (emptyState) {
         emptyState.remove();
+    }
+    
+    // If this is an assistant message and there's already one, update it instead
+    if (message.role === 'assistant') {
+        const lastAssistantMessage = chatContainer.querySelector('.message.assistant:last-child');
+        if (lastAssistantMessage) {
+            // Update the last assistant message instead of creating a new one
+            updateLastAssistantMessage(message.content);
+            return;
+        }
     }
     
     const messageDiv = document.createElement('div');

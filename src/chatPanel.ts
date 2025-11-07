@@ -2,6 +2,8 @@ import * as vscode from 'vscode';
 import { MCPTools } from './mcpTools';
 import { AdvancedOrchestrator } from './orchestration/orchestrator';
 import { ReActOrchestrator } from './orchestration/reactOrchestrator';
+import { LangChainOrchestrator } from './orchestration/langchainOrchestrator';
+import { MCPToolAdapter } from './orchestration/mcpToolAdapter';
 import { getWebviewHtml } from './webviewContent';
 import { gatherCodeContext } from './contextGatherer';
 import { MessageHandlers } from './messageHandlers';
@@ -16,7 +18,9 @@ export class ChatPanel {
     private _mcpTools: MCPTools;
     private _orchestrator: AdvancedOrchestrator;
     private _reactOrchestrator: ReActOrchestrator;
-    private _useReAct: boolean = true; // Use ReAct by default for state-of-the-art
+    private _langchainOrchestrator: LangChainOrchestrator | null = null;
+    private _useLangChain: boolean = true; // Use LangChain orchestrator
+    private _useReAct: boolean = false; // Fallback only
     private _messageHandlers: MessageHandlers;
 
 
@@ -26,6 +30,7 @@ export class ChatPanel {
         this._mcpTools = new MCPTools();
         this._orchestrator = new AdvancedOrchestrator(this._mcpTools);
         this._reactOrchestrator = new ReActOrchestrator(this._mcpTools);
+        // LangChain orchestrator will be initialized lazily with model/URL
 
         // Set the webview's initial html content
         this._update();
@@ -150,8 +155,10 @@ export class ChatPanel {
             // Get code context from open files
             const context = await gatherCodeContext();
 
-            // Get available tools description
-            const toolsDescription = this._mcpTools.getAvailableTools();
+            // Get available tools description using the adapter (for ReAct orchestrator)
+            // Note: LangChain orchestrator gets tools directly from the adapter
+            const mcpToolAdapter = new MCPToolAdapter(this._mcpTools);
+            const toolsDescription = mcpToolAdapter.getToolsDescription();
 
             // Build system message - Cursor-like approach
             const systemMessage = `You are an AI coding assistant similar to Cursor. You help developers write, edit, and understand code.
@@ -187,41 +194,87 @@ REMEMBER:
 - Verify your work
 - Ask for clarification if needed`;
 
-            // Use ReAct orchestrator for state-of-the-art execution (Reasoning + Acting)
-            if (this._useReAct) {
+            // Use LangChain orchestrator (preferred) with fallback to ReAct
+            const progressCallback = (progress: string) => {
+                this._panel.webview.postMessage({
+                    command: 'status',
+                    message: progress
+                });
+            };
+
+            const toolExecutionCallback = (toolCall: any, result: any) => {
+                this._panel.webview.postMessage({
+                    command: 'addMessage',
+                    message: {
+                        role: 'system',
+                        content: `🔧 ${toolCall.name}: ${result.success ? '✓' : '✗'} ${result.error || (result.content ? result.content.substring(0, 100) : '')}`,
+                        timestamp: new Date().toISOString()
+                    },
+                    conversationId
+                });
+            };
+
+            const messageCallback = (role: string, content: string) => {
+                this._panel.webview.postMessage({
+                    command: 'addMessage',
+                    message: {
+                        role,
+                        content,
+                        timestamp: new Date().toISOString()
+                    },
+                    conversationId
+                });
+            };
+
+            if (this._useLangChain) {
+                try {
+                    // Initialize or recreate LangChain orchestrator if model/URL changed
+                    if (!this._langchainOrchestrator ||
+                        this._langchainOrchestrator.currentModel !== model ||
+                        this._langchainOrchestrator.currentUrl !== this._ollamaUrl) {
+                        this._langchainOrchestrator = new LangChainOrchestrator(
+                            this._mcpTools,
+                            model,
+                            this._ollamaUrl
+                        );
+                    }
+
+                    await this._langchainOrchestrator.orchestrate(
+                        text,
+                        systemMessage,
+                        model,
+                        this._ollamaUrl,
+                        progressCallback,
+                        toolExecutionCallback,
+                        messageCallback
+                    );
+                } catch (langchainError: any) {
+                    console.error('LangChain orchestrator error:', langchainError);
+                    // Fallback to ReAct orchestrator
+                    this._useLangChain = false;
+                    this._useReAct = true;
+                    messageCallback('system', `⚠️ LangChain error: ${langchainError.message}. Falling back to ReAct orchestrator.`);
+
+                    await this._reactOrchestrator.orchestrate(
+                        text,
+                        systemMessage,
+                        model,
+                        this._ollamaUrl,
+                        progressCallback,
+                        toolExecutionCallback,
+                        messageCallback
+                    );
+                }
+            } else if (this._useReAct) {
+                // Use ReAct orchestrator
                 await this._reactOrchestrator.orchestrate(
                     text,
                     systemMessage,
                     model,
                     this._ollamaUrl,
-                    (progress) => {
-                        this._panel.webview.postMessage({
-                            command: 'status',
-                            message: progress
-                        });
-                    },
-                    (toolCall, result) => {
-                        this._panel.webview.postMessage({
-                            command: 'addMessage',
-                            message: {
-                                role: 'system',
-                                content: `🔧 ${toolCall.name}: ${result.success ? '✓' : '✗'} ${result.error || (result.content ? result.content.substring(0, 100) : '')}`,
-                                timestamp: new Date().toISOString()
-                            },
-                            conversationId
-                        });
-                    },
-                    (role, content) => {
-                        this._panel.webview.postMessage({
-                            command: 'addMessage',
-                            message: {
-                                role,
-                                content,
-                                timestamp: new Date().toISOString()
-                            },
-                            conversationId
-                        });
-                    }
+                    progressCallback,
+                    toolExecutionCallback,
+                    messageCallback
                 );
             } else {
                 // Fallback to advanced orchestrator
@@ -230,34 +283,9 @@ REMEMBER:
                     systemMessage,
                     model,
                     this._ollamaUrl,
-                    (progress) => {
-                        this._panel.webview.postMessage({
-                            command: 'status',
-                            message: progress
-                        });
-                    },
-                    (toolCall, result) => {
-                        this._panel.webview.postMessage({
-                            command: 'addMessage',
-                            message: {
-                                role: 'system',
-                                content: `🔧 ${toolCall.name}: ${result.success ? '✓' : '✗'} ${result.error || (result.content ? result.content.substring(0, 100) : '')}`,
-                                timestamp: new Date().toISOString()
-                            },
-                            conversationId
-                        });
-                    },
-                    (role, content) => {
-                        this._panel.webview.postMessage({
-                            command: 'addMessage',
-                            message: {
-                                role,
-                                content,
-                                timestamp: new Date().toISOString()
-                            },
-                            conversationId
-                        });
-                    }
+                    progressCallback,
+                    toolExecutionCallback,
+                    messageCallback
                 );
             }
         } catch (error: any) {
