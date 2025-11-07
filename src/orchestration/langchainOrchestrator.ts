@@ -4,25 +4,29 @@
  */
 
 import * as vscode from 'vscode';
+import * as path from 'path';
 import { ChatOllama } from '@langchain/ollama';
 import { createAgent, tool } from 'langchain';
 import { z } from 'zod';
 import { MCPTools } from '../mcpTools';
-import { ToolCall, ToolResult, CodebaseState, FileChange } from '../types';
+import { ToolCall, ToolResult, CodebaseState, FileChange, SubAgent, SubAgentResult } from '../types';
 import { MCPToolAdapter } from './mcpToolAdapter';
 import { gatherCodeContext } from '../contextGatherer';
 import { getAIResponse } from '../ollamaClient';
+import { CodeAnalyzer } from './codeAnalyzer';
 
 // Import message classes with require to avoid module resolution issues
 let HumanMessage: any;
 let AIMessage: any;
 let ToolMessage: any;
+let SystemMessage: any;
 
 try {
     const messagesModule = require('@langchain/core/messages');
     HumanMessage = messagesModule.HumanMessage;
     AIMessage = messagesModule.AIMessage;
     ToolMessage = messagesModule.ToolMessage;
+    SystemMessage = messagesModule.SystemMessage;
 } catch {
     // Fallback: create simple message-like objects
     HumanMessage = class {
@@ -34,12 +38,17 @@ try {
         getType() { return 'ai'; }
     };
     ToolMessage = class {
-        constructor(public content: string, public tool_call_id?: string) {
+        constructor(public content: string, public tool_call_id?: string, public name?: string) {
             this.tool_call_id = tool_call_id;
+            this.name = name;
         }
         getType() { return 'tool'; }
         // Add status field to match LangChain's ToolMessage structure
         status?: 'success' | 'error' = 'success';
+    };
+    SystemMessage = class {
+        constructor(public content: string) { }
+        getType() { return 'system'; }
     };
 }
 
@@ -52,6 +61,7 @@ export class LangChainOrchestrator {
     private toolAdapter: MCPToolAdapter;
     private llm: ChatOllama;
     private tools: ReturnType<typeof tool>[];
+    private modelWithTools: any; // Model with tools bound using bind_tools()
     private agent: ReturnType<typeof createAgent> | null = null;
     private maxIterations: number = 50; // Increased for complex tasks
     private maxExecutionTime: number = 10 * 60 * 1000; // 10 minutes for complex tasks
@@ -69,6 +79,17 @@ export class LangChainOrchestrator {
     private fileChanges: FileChange[] = [];
     private conversationHistory: Array<{ role: string; content: string; timestamp: Date }> = [];
     private recentActions: Array<{ action: string; timestamp: number }> = [];
+    private todos: Array<{ task: string; status: 'pending' | 'in_progress' | 'completed' }> = [];
+
+    // State-of-the-art features (Deep Agents inspired)
+    private readonly LARGE_RESULT_THRESHOLD = 50000; // ~20k tokens (rough estimate: 1 token ≈ 2.5 chars)
+    private readonly MAX_MESSAGES_BEFORE_SUMMARIZATION = 50;
+    private readonly MESSAGES_TO_KEEP_INTACT = 6;
+    private toolResultCache: Map<string, string> = new Map(); // Cache for evicted large results
+
+    // Subagent system
+    private subagents: Map<string, SubAgent> = new Map();
+    private readonly GENERAL_PURPOSE_SUBAGENT_NAME = 'general-purpose';
 
     constructor(mcpTools: MCPTools, model: string, ollamaUrl: string) {
         this.mcpTools = mcpTools;
@@ -87,7 +108,113 @@ export class LangChainOrchestrator {
         });
 
         // Create LangChain tools using the adapter
-        this.tools = this.toolAdapter.toLangChainTools();
+        const mcpToolsList = this.toolAdapter.toLangChainTools();
+
+        // Add planning tool (write_todos) similar to Deep Agents
+        const planningTool = tool(
+            async ({ todos: todoList }: { todos: Array<{ task: string; status?: 'pending' | 'in_progress' | 'completed' }> }) => {
+                // Update todos list
+                this.todos = todoList.map(t => ({
+                    task: t.task,
+                    status: t.status || 'pending'
+                }));
+
+                // Format todos for display
+                const formatted = this.todos.map((t, i) => {
+                    const statusIcon = t.status === 'completed' ? '✅' : t.status === 'in_progress' ? '🔄' : '⏳';
+                    return `${i + 1}. ${statusIcon} ${t.task}`;
+                }).join('\n');
+
+                return `Todo list updated:\n\n${formatted}`;
+            },
+            {
+                name: 'write_todos',
+                description: 'Create or update a todo list to break down complex tasks into discrete steps. Use this for planning multi-step tasks. Each todo should be a clear, actionable step.',
+                schema: z.object({
+                    todos: z.array(z.object({
+                        task: z.string().describe('A clear, actionable task description'),
+                        status: z.enum(['pending', 'in_progress', 'completed']).optional().describe('The status of this task')
+                    })).describe('List of todos/tasks to track')
+                }),
+            }
+        );
+
+        // Add advanced code analysis tool
+        const analyzeCodeTool = tool(
+            async ({ file_path }: { file_path: string }) => {
+                try {
+                    // Resolve file path relative to workspace
+                    const workspaceFolders = require('vscode').workspace.workspaceFolders;
+                    const workspaceRoot = workspaceFolders?.[0]?.uri.fsPath || process.cwd();
+                    const fullPath = path.isAbsolute(file_path)
+                        ? file_path
+                        : path.join(workspaceRoot, file_path);
+
+                    const content = require('fs').readFileSync(fullPath, 'utf-8');
+                    const summary = CodeAnalyzer.getCodeSummary(fullPath, content);
+
+                    // Also detect duplicates
+                    const duplicates = CodeAnalyzer.detectDuplicateEndpoints(fullPath, content);
+                    if (duplicates.length > 0) {
+                        return `${summary}\n\n⚠️ ISSUES FOUND:\n${duplicates.map(d =>
+                            `- ${d.type}: ${d.occurrences.length} duplicate occurrences at lines ${d.occurrences.map(o => o.line).join(', ')}`
+                        ).join('\n')}\n\nACTION REQUIRED: Remove the duplicate endpoint(s) using replace_code or search_replace.`;
+                    }
+
+                    return summary;
+                } catch (error: any) {
+                    return `Error analyzing file: ${error.message}. Make sure the file path is correct (can be relative to workspace root or absolute path).`;
+                }
+            },
+            {
+                name: 'analyze_code',
+                description: 'Perform deep code analysis on a file. Understands code structure, detects duplicates, endpoints, functions, and classes. Use this FIRST when checking for duplicates or understanding code structure - it automatically detects and reports issues. Works with any file path (relative or absolute).',
+                schema: z.object({
+                    file_path: z.string().describe('The path to the file to analyze (can be relative to workspace root or absolute path)')
+                }),
+            }
+        );
+
+        // Initialize general-purpose subagent (always available)
+        this.subagents.set(this.GENERAL_PURPOSE_SUBAGENT_NAME, {
+            name: this.GENERAL_PURPOSE_SUBAGENT_NAME,
+            description: 'A general-purpose subagent for context isolation. Use this to delegate complex multi-step tasks that would clutter the main agent\'s context. The subagent will work independently and return a concise summary.',
+            systemPrompt: 'You are a helpful assistant that completes tasks efficiently. Work independently and return concise, actionable results.',
+            tools: [] // All tools available
+        });
+
+        // Add task delegation tool (for subagents)
+        const taskTool = tool(
+            async ({ name, task }: { name: string; task: string }) => {
+                return await this.executeSubagentTask(name, task);
+            },
+            {
+                name: 'task',
+                description: `Delegate a task to a subagent for context isolation. Available subagents:
+- ${this.GENERAL_PURPOSE_SUBAGENT_NAME}: Use for any complex multi-step task that would clutter context. Always available.
+${Array.from(this.subagents.values())
+                        .filter(sa => sa.name !== this.GENERAL_PURPOSE_SUBAGENT_NAME)
+                        .map(sa => `- ${sa.name}: ${sa.description}`)
+                        .join('\n')}
+
+Use subagents when:
+- A task requires many tool calls that would fill up context
+- You need to keep the main conversation focused on high-level coordination
+- The task is complex and multi-step
+
+The subagent will work independently and return a concise summary.`,
+                schema: z.object({
+                    name: z.string().describe('The name of the subagent to delegate to'),
+                    task: z.string().describe('The task description for the subagent to complete')
+                }),
+            }
+        );
+
+        this.tools = [...mcpToolsList, planningTool, analyzeCodeTool, taskTool];
+
+        // Bind tools to the model using LangChain's bindTools() method
+        // This enables native tool calling support
+        this.modelWithTools = this.llm.bindTools(this.tools);
     }
 
     /**
@@ -421,83 +548,103 @@ export class LangChainOrchestrator {
 
         const workspaceState = this.getWorkspaceStateSummary();
 
-        // Enhanced system message with state-of-the-art features
+        // State-of-the-art system prompt - Natural, reasoning-focused, like Cursor/Copilot
         const enhancedSystemMessage = `${systemMessage}
 
-You are an advanced AI coding assistant (like Cursor or GitHub Copilot) with deep codebase understanding and intelligent task execution.
+You are an expert AI coding assistant, similar to Cursor or GitHub Copilot. You help developers write, edit, and understand code through natural conversation and intelligent code manipulation.
 
 ${workspaceState !== 'No recent activity.' ? `CURRENT WORKSPACE STATE:\n${workspaceState}\n\n` : ''}
 
 ${additionalContext ? `CURRENT CONTEXT:\n${additionalContext}\n\n` : ''}
 
-You are an advanced AI coding assistant with deep understanding of software development workflows. Your goal is to help users accomplish coding tasks by intelligently using the available tools.
+## Your Approach
 
-## REASONING PROCESS (ReAct Pattern)
+Work like a senior developer pair-programming with the user:
 
-Think step-by-step about each task:
+1. **Understand Context First**: When given a task, start by understanding the codebase structure. Use list_files to explore, analyze_code to understand code structure and detect issues, or read_file for full file content. Adapt to whatever structure the codebase has.
 
-1. **OBSERVE**: Understand the current state
-   - What files exist in the codebase?
-   - What is the task asking for?
-   - What context do you have?
+2. **Reason About Solutions**: Think through the problem naturally. What needs to change? Why? What's the best approach? For complex tasks, break them down using write_todos.
 
-2. **REASON**: Plan your approach
-   - What information do you need?
-   - Which files should you examine?
-   - What changes need to be made?
-   - What's the best way to accomplish this?
+3. **Take Action**: Make changes directly using the appropriate tools. When you understand what needs to be done, do it. Don't just describe what you'll do - actually execute the changes.
 
-3. **ACT**: Execute tools based on your reasoning
-   - Use tools to gather information
-   - Use tools to make changes
-   - Verify your work
+4. **Verify and Iterate**: After making changes, verify they work. Re-read the file, re-analyze it, check syntax, test if appropriate, and refine as needed.
 
-4. **REFLECT**: After each tool execution
-   - What did you learn?
-   - What should you do next?
-   - Are you making progress toward the goal?
+## Code Understanding
 
-## AVAILABLE TOOLS
+You have access to advanced code analysis tools:
+- **analyze_code**: Deep code analysis that understands structure, detects duplicates, lists endpoints/functions/classes. Use this FIRST when you need to understand code structure or check for issues like duplicates. It automatically detects and reports problems.
+- **read_file**: Read full file contents when you need to see the full code
+- **analyze_code_structure**: Analyze code structure and dependencies
+
+When to use analyze_code:
+- When checking for duplicates or code issues
+- When understanding what endpoints/functions/classes exist in a file
+- When analyzing code structure before making changes
+- When the user asks you to "check", "verify", "review", or mentions duplicates
+
+The analyze_code tool automatically detects issues and shows you exactly where they are, making it much faster than manually reading and analyzing code.
+
+## Working with Code
+
+When editing code, follow these principles:
+- **Understand first**: Use analyze_code to understand structure and detect issues, then read_file for full content when needed
+- **Targeted edits**: Use replace_code or search_replace for specific changes (removing duplicates, fixing issues). Use write_file for creating new files or complete rewrites
+- **Incremental changes**: Make small, focused edits rather than large rewrites
+- **Preserve style**: Match existing code style and patterns
+- **Verify**: Check syntax and test your changes when appropriate
+- **Explain**: Describe what you changed and why
+
+For fixing issues like duplicates:
+- Use analyze_code to automatically detect the issue
+- The tool will show you exactly where the problem is
+- Use replace_code or search_replace to fix it (these are better for targeted edits than write_file)
+- Remove the entire problematic block, not just part of it
+
+## Available Tools
 
 ${this.toolAdapter.getToolsDescription()}
 
-## TOOL USAGE GUIDELINES
+### Task Delegation (Subagents)
 
-- **Understanding code**: Use read_file, analyze_code_structure, find_dependencies, get_code_context
-- **Finding files**: Use list_files or search_files to explore the codebase
-- **Making changes**: 
-  - Use read_file FIRST to understand existing code
-  - Use insert_code to add new code at a specific line
-  - Use replace_code to replace a code block
-  - Use search_replace for simple text replacements
-  - Use write_file to create new files
-- **Validation**: Use validate_syntax to check your changes
-- **Testing**: Use run_tests or run_command for testing
+You have access to a \`task\` tool for delegating work to subagents. This is useful for:
+- Complex multi-step tasks that would clutter your context
+- Tasks requiring many tool calls (e.g., exploring a large codebase, running multiple analyses)
+- Keeping your main conversation focused on high-level coordination
 
-## IMPORTANT PRINCIPLES
+Use \`task(name="general-purpose", task="...")\` to delegate complex tasks. The subagent will work independently in isolated context and return a concise summary.
 
-1. **Understand before modifying**: Always read files before editing them
-2. **Make incremental changes**: Small, focused edits are better than large rewrites
-3. **Verify your work**: Check syntax and test when appropriate
-4. **Learn from results**: Use tool outputs to inform your next steps
-5. **Think about the user's intent**: Understand what they're trying to accomplish, not just what they asked for
+**Available subagents:**
+- **general-purpose**: Always available. Use for any complex multi-step task that would clutter context. The subagent will complete the task independently and return a summary.
 
-## TOOL USAGE
+## Workflow Patterns
 
-You have access to tools that can be called automatically. When you need to use a tool, call it naturally. The system will execute the tool and provide you with the result. You MUST then:
-1. Read and understand the tool result
-2. Decide what to do next based on the result
-3. Execute the next tool or complete the task
-4. DO NOT stop after one tool - keep going until the task is done
+**When checking for duplicates or issues**:
+1. Use analyze_code FIRST on the file in question to automatically detect duplicates, issues, and understand structure
+2. Review the analysis output - it will highlight any issues found
+3. Read the file to see the exact code if needed
+4. Use replace_code or search_replace to fix the issue (NOT write_file for targeted edits)
+5. Verify the fix by re-reading or re-analyzing the file
 
-Example workflow:
-- Tool 1: list_files -> See files listed
-- Tool 2: read_file -> See file content  
-- Tool 3: insert_code -> Modify file
-- Tool 4: read_file -> Read another file if needed
-- Continue until task complete
+**When exploring a codebase**:
+1. Use list_files to understand the project structure
+2. Use read_file or analyze_code to examine specific files
+3. Look for entry points, configuration files, or relevant code
+4. Provide specific instructions based on what you discover
 
-CRITICAL: Never stop after just one tool execution. Always continue until the task is complete. After each tool execution, immediately decide on the next step and execute it.
+**When making changes**:
+1. Understand the code structure first (analyze_code for structure, read_file for full content)
+2. Use the appropriate editing tool (replace_code, search_replace, insert_code, or write_file)
+3. Make focused, incremental changes
+4. Verify your changes work
+
+## Principles
+
+- Be conversational and helpful
+- Explain your reasoning as you work
+- Make changes incrementally and show progress
+- Verify your work
+- Think about the user's intent, not just literal requests
+- Use tools naturally as part of your workflow
 `;
 
         // Create agent - LangChain v1.0 API
@@ -531,6 +678,7 @@ Think step-by-step about each task:
    - What context do you have?
 
 2. **REASON**: Plan your approach
+   - For complex, multi-step tasks, use the write_todos tool to break down the work into discrete steps
    - What information do you need?
    - Which files should you examine?
    - What changes need to be made?
@@ -540,11 +688,13 @@ Think step-by-step about each task:
    - Use tools to gather information
    - Use tools to make changes
    - Verify your work
+   - Update todo status as you progress
 
 4. **REFLECT**: After each tool execution
    - What did you learn?
    - What should you do next?
    - Are you making progress toward the goal?
+   - Update todos to reflect completed steps
 
 ${workspaceState !== 'No recent activity.' ? `CURRENT WORKSPACE STATE:\n${workspaceState}\n\n` : ''}
 
@@ -579,6 +729,18 @@ CRITICAL: After each tool result, immediately decide on the next step and execut
     }
 
     /**
+     * Get SystemMessage class (for creating system messages)
+     */
+    private getSystemMessageClass(): any {
+        try {
+            const messagesModule = require('@langchain/core/messages');
+            return messagesModule.SystemMessage;
+        } catch {
+            return SystemMessage;
+        }
+    }
+
+    /**
      * Orchestrate a task using LangChain
      */
     async orchestrate(
@@ -600,8 +762,13 @@ CRITICAL: After each tool result, immediately decide on the next step and execut
                 this.llm = new ChatOllama({
                     model,
                     baseUrl: ollamaUrl,
-                    temperature: 0.7,
+                    temperature: 0.2, // Lower temperature for more deterministic code generation
+                    topK: 40,
+                    topP: 0.9,
+                    numCtx: 8192,
                 });
+                // Rebind tools to the new model
+                this.modelWithTools = this.llm.bindTools(this.tools);
                 this.agent = null; // Reset agent to recreate with new model
             }
 
@@ -617,23 +784,30 @@ CRITICAL: After each tool result, immediately decide on the next step and execut
             onProgress('Initializing LangChain agent...');
             const agent = await this.initializeAgent(systemMessage, codeContext || undefined);
 
-            // Use Ollama's native tool calling API for proper agent loop
-            // This uses structured tool_calls instead of JSON parsing
+            // Use LangChain's native tool calling with bind_tools()
+            // This is the proper way to use tools with LangChain models
 
             const systemPrompt = this.buildSystemPrompt(systemMessage, codeContext || undefined);
 
-            // Convert LangChain tools to Ollama tool format
-            const ollamaTools = this.convertToolsToOllamaFormat();
-
-            // Build message history for agent loop
+            // Build message history using LangChain message types
             const messages: any[] = [];
 
+            // Add system message
+            messages.push(new SystemMessage(systemPrompt));
+
             // Initial user message with task
-            messages.push({ role: 'user', content: task });
+            messages.push(new HumanMessage(task));
 
             // Main agent loop using Ollama's native tool calling
+            // LangChain's bindTools() converts tools to Ollama format and handles message conversion
+            // Ollama format: { role: "tool", tool_name: "...", content: "..." }
+            // LangChain format: ToolMessage(content, tool_call_id, name)
+            // LangChain automatically converts between formats when calling Ollama API
             let iterationCount = 0;
             const maxIterations = 50;
+
+            // Track message history for summarization
+            let totalMessageTokens = 0; // Rough estimate
 
             while (iterationCount < maxIterations && Date.now() - startTime < this.maxExecutionTime) {
                 iterationCount++;
@@ -651,84 +825,183 @@ CRITICAL: After each tool result, immediately decide on the next step and execut
                 onProgress(`Iteration ${iterationCount}/${maxIterations}...`);
 
                 try {
-                    // Prepare messages for Ollama API
-                    const ollamaMessages: any[] = [
-                        { role: 'system', content: systemPrompt },
-                        ...messages
-                    ];
+                    // Use LangChain's model.invoke() with bound tools
+                    // LangChain's bindTools() automatically converts tools to Ollama format
+                    // and handles the conversion between LangChain and Ollama message formats
+                    const response = await this.modelWithTools.invoke(messages);
 
-                    // Call Ollama API with native tool calling support
-                    const response = await this.callOllamaWithTools(
-                        ollamaMessages,
-                        model,
-                        ollamaUrl,
-                        ollamaTools
-                    );
+                    // Debug: Log response structure
+                    console.log('LangChain response:', JSON.stringify({
+                        hasContent: !!response.content,
+                        contentLength: typeof response.content === 'string' ? response.content.length : 0,
+                        hasToolCalls: !!response.tool_calls,
+                        toolCallsCount: response.tool_calls?.length || 0,
+                        toolCalls: response.tool_calls?.map((tc: any) => ({
+                            name: tc.name,
+                            args: tc.args,
+                            id: tc.id
+                        }))
+                    }, null, 2));
 
-                    // Handle response
-                    if (response.message.content) {
-                        onMessage('assistant', response.message.content);
-                    }
+                    // Handle tool calls if present (LangChain format: response.tool_calls)
+                    const toolCalls = response.tool_calls || [];
+                    const hasNativeToolCalls = toolCalls.length > 0;
 
-                    // Add assistant message to history
-                    const assistantMessage: any = {
-                        role: 'assistant',
-                        content: response.message.content || ''
-                    };
+                    // Get content from LangChain AIMessage
+                    const content = typeof response.content === 'string'
+                        ? response.content
+                        : (Array.isArray(response.content)
+                            ? response.content.map((c: any) => c.text || c).join('')
+                            : String(response.content || ''));
 
-                    // Handle tool calls if present
-                    if (response.message.tool_calls && response.message.tool_calls.length > 0) {
-                        assistantMessage.tool_calls = response.message.tool_calls;
+                    // Check for JSON tool calls in content (fallback for models that don't support native tool calling)
+                    const jsonToolCall = this.parseJSONToolCallWithPosition(content);
+                    const hasJSONToolCall = jsonToolCall && jsonToolCall.toolCall;
 
-                        // Execute all tool calls in parallel
-                        const toolResults: any[] = [];
-                        for (const toolCall of response.message.tool_calls) {
-                            const toolResult = await this.executeOllamaToolCall(
+                    if (hasNativeToolCalls) {
+                        // Model wants to call tools (native tool calling via LangChain)
+
+                        // Show reasoning/thinking if any
+                        if (content && content.trim()) {
+                            onMessage('assistant', content);
+                        }
+
+                        // Add the AI message with tool calls to history
+                        messages.push(response);
+
+                        // Execute all tool calls and create ToolMessage objects
+                        const toolMessages: any[] = [];
+                        for (const toolCall of toolCalls) {
+                            // Execute the tool
+                            const toolResult = await this.executeLangChainToolCall(
                                 toolCall,
                                 onProgress,
                                 onToolExecution,
                                 onMessage
                             );
-                            toolResults.push(toolResult);
+
+                            // Create ToolMessage with tool_call_id and name to link result to call
+                            // LangChain ToolMessage format: { content, tool_call_id, name }
+                            // LangChain will automatically convert this to Ollama format:
+                            // { role: "tool", tool_name: name, content: content }
+                            // when calling the Ollama API in the next iteration
+                            const ToolMessageClass = this.getToolMessageClass();
+                            const toolCallId = toolCall.id || `call_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+                            const toolMessage = new ToolMessageClass(
+                                toolResult.content,
+                                toolCallId,
+                                toolCall.name
+                            );
+                            toolMessages.push(toolMessage);
                         }
 
-                        // Add assistant message with tool calls
-                        messages.push(assistantMessage);
+                        // Add tool results to messages (LangChain format: ToolMessage objects)
+                        messages.push(...toolMessages);
 
-                        // Add tool results to messages
-                        for (const toolResult of toolResults) {
-                            messages.push({
-                                role: 'tool',
-                                tool_name: toolResult.tool_name,
-                                content: toolResult.content
-                            });
+                        // Estimate token usage and summarize if needed (Deep Agents feature)
+                        totalMessageTokens += this.estimateTokens(JSON.stringify(toolMessages));
+                        if (messages.length > this.MAX_MESSAGES_BEFORE_SUMMARIZATION) {
+                            await this.summarizeConversationHistory(messages, onMessage);
+                            totalMessageTokens = this.estimateTokens(JSON.stringify(messages));
                         }
 
                         // Continue loop - model will see tool results and continue
                         continue;
-                    } else {
-                        // No tool calls - add assistant message and check if done
+                    } else if (hasJSONToolCall && jsonToolCall.toolCall) {
+                        // Model output JSON tool call in text (fallback for models without native support)
+                        console.log('Found JSON tool call in text, parsing and executing...');
+
+                        // Show content without the JSON tool call
+                        const cleanContent = this.filterToolCallJSON(content);
+                        if (cleanContent.trim()) {
+                            onMessage('assistant', cleanContent);
+                        }
+
+                        // Execute the parsed tool call
+                        const toolCall = jsonToolCall.toolCall;
+                        const toolResult = await this.executeLangChainToolCall(
+                            {
+                                name: toolCall.name,
+                                args: toolCall.arguments,
+                                id: `call_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
+                            },
+                            onProgress,
+                            onToolExecution,
+                            onMessage
+                        );
+
+                        // Add assistant message to history (create AIMessage with clean content)
+                        const AIMessageClass = this.getAIMessageClass();
+                        const assistantMessage = new AIMessageClass(cleanContent);
                         messages.push(assistantMessage);
 
-                        // Check if task is complete
-                        const completionCheck = await this.checkTaskCompletion(task);
-                        if (completionCheck.complete) {
-                            onMessage('system', `✅ ${completionCheck.summary}`);
-                            break;
+                        // Create ToolMessage with tool_call_id and name
+                        const ToolMessageClass = this.getToolMessageClass();
+                        const toolCallId = (toolCall as any).id || `call_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+                        const toolMessage = new ToolMessageClass(
+                            toolResult.content,
+                            toolCallId,
+                            toolCall.name
+                        );
+                        messages.push(toolMessage);
+
+                        // Estimate token usage and summarize if needed (Deep Agents feature)
+                        totalMessageTokens += this.estimateTokens(JSON.stringify(toolMessage));
+                        if (messages.length > this.MAX_MESSAGES_BEFORE_SUMMARIZATION) {
+                            await this.summarizeConversationHistory(messages, onMessage);
+                            totalMessageTokens = this.estimateTokens(JSON.stringify(messages));
                         }
 
-                        // If model says it's done, stop
-                        if (response.message.content && (
-                            response.message.content.toLowerCase().includes('complete') ||
-                            response.message.content.toLowerCase().includes('done') ||
-                            response.message.content.toLowerCase().includes('finished')
-                        )) {
-                            onMessage('system', '✅ Model indicates task is complete.');
-                            break;
-                        }
-
-                        // Otherwise continue (model might be reasoning)
+                        // Continue loop - model will see tool result and continue
                         continue;
+                    } else {
+                        // No tool calls - model is giving a final answer
+
+                        // Show the response only if it's meaningful (not empty or generic)
+                        const isGenericResponse = content.toLowerCase().includes('feel free to let me know') ||
+                            content.toLowerCase().includes('if you have any questions') ||
+                            content.toLowerCase().includes('additional information') ||
+                            (content.trim().length < 20 && !content.includes('✅') && !content.includes('❌'));
+
+                        if (content.trim() && !isGenericResponse) {
+                            // Only show if it's a real response, not a generic placeholder
+                            onMessage('assistant', content);
+
+                            // Add the AI message to history
+                            messages.push(response);
+
+                            // If it's a meaningful response, we're done
+                            break;
+                        } else if (iterationCount === 1 && !hasNativeToolCalls && !hasJSONToolCall) {
+                            // First iteration and no tool calls - model isn't using tools when it should
+                            // Add a nudge to use tools
+                            onMessage('system', '💡 Hint: Use tools to explore the codebase. Try list_files to see what files exist.');
+
+                            // Add a system message encouraging tool use
+                            messages.push({
+                                role: 'user',
+                                content: 'Please use the available tools to explore the codebase and help me with the task. Start by using list_files to see what files exist.'
+                            });
+
+                            // Continue to give model another chance
+                            continue;
+                        } else {
+                            // Generic or empty response - check if task is complete
+                            const completionCheck = await this.checkTaskCompletion(task);
+                            if (completionCheck.complete) {
+                                onMessage('system', `✅ ${completionCheck.summary}`);
+                                break;
+                            }
+
+                            // If we've tried multiple times and still no tool calls, break
+                            if (iterationCount >= 3) {
+                                onMessage('system', '⚠️ Model is not using tools. Please try rephrasing your request to be more specific.');
+                                break;
+                            }
+
+                            // Otherwise continue (model might be reasoning)
+                            continue;
+                        }
                     }
                 } catch (error: any) {
                     onMessage('system', `⚠️ Error in iteration ${iterationCount}: ${error.message}`);
@@ -887,6 +1160,9 @@ CRITICAL: After each tool result, immediately decide on the next step and execut
         const axios = require('axios');
 
         try {
+            // Log what we're sending (for debugging)
+            console.log(`Calling Ollama with ${tools.length} tools, ${messages.length} messages`);
+
             const response = await axios.post(
                 `${ollamaUrl}/api/chat`,
                 {
@@ -913,6 +1189,11 @@ CRITICAL: After each tool result, immediately decide on the next step and execut
                 throw new Error('Invalid response from Ollama API: missing message');
             }
 
+            // Check if tool_calls exists (some models might not support it)
+            if (!response.data.message.tool_calls && tools.length > 0) {
+                console.warn('Model response does not contain tool_calls. The model might not support tool calling.');
+            }
+
             return response.data;
         } catch (error: any) {
             if (error.response?.status === 404) {
@@ -924,21 +1205,26 @@ CRITICAL: After each tool result, immediately decide on the next step and execut
             } else if (error.code === 'ETIMEDOUT' || error.message.includes('timeout')) {
                 throw new Error(`Connection to Ollama timed out. The model may be too large or slow.`);
             }
+
+            // Log the full error for debugging
+            console.error('Ollama API error:', error.response?.data || error.message);
             throw error;
         }
     }
 
     /**
-     * Execute an Ollama tool call (from structured tool_calls response)
+     * Execute a LangChain tool call (from response.tool_calls)
+     * Returns content string for ToolMessage
      */
-    private async executeOllamaToolCall(
+    private async executeLangChainToolCall(
         toolCall: any,
         onProgress: (message: string) => void,
         onToolExecution: (toolCall: ToolCall, result: ToolResult) => void,
         onMessage: (role: string, content: string) => void
-    ): Promise<{ tool_name: string; content: string }> {
-        const toolName = toolCall.function?.name || toolCall.name;
-        const toolArgs = toolCall.function?.arguments || toolCall.arguments || {};
+    ): Promise<{ content: string }> {
+        // LangChain tool calls have format: { name: string, args: object, id: string }
+        const toolName = toolCall.name;
+        const toolArgs = toolCall.args || {};
 
         if (!toolName) {
             throw new Error('Tool call missing name');
@@ -975,9 +1261,8 @@ CRITICAL: After each tool result, immediately decide on the next step and execut
                 onMessage('system', `❌ ${toolName} failed: ${result.error || 'Unknown error'}`);
             }
 
-            // Return result in Ollama format
+            // Return content for ToolMessage (LangChain format)
             return {
-                tool_name: toolName,
                 content: result.success
                     ? (result.content || 'Success')
                     : `Error: ${result.error || 'Unknown error'}`
@@ -993,10 +1278,39 @@ CRITICAL: After each tool result, immediately decide on the next step and execut
             onMessage('system', `❌ ${toolName} error: ${error.message}`);
 
             return {
-                tool_name: toolName,
                 content: `Error: ${error.message || 'Tool execution failed'}`
             };
         }
+    }
+
+    /**
+     * Execute an Ollama tool call (from structured tool_calls response) - DEPRECATED
+     * Use executeLangChainToolCall instead
+     */
+    private async executeOllamaToolCall(
+        toolCall: any,
+        onProgress: (message: string) => void,
+        onToolExecution: (toolCall: ToolCall, result: ToolResult) => void,
+        onMessage: (role: string, content: string) => void
+    ): Promise<{ tool_name: string; content: string }> {
+        // Convert Ollama format to LangChain format and call executeLangChainToolCall
+        const langchainToolCall = {
+            name: toolCall.function?.name || toolCall.name,
+            args: toolCall.function?.arguments || toolCall.arguments || {},
+            id: toolCall.id || `call_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
+        };
+
+        const result = await this.executeLangChainToolCall(
+            langchainToolCall,
+            onProgress,
+            onToolExecution,
+            onMessage
+        );
+
+        return {
+            tool_name: langchainToolCall.name,
+            content: result.content
+        };
     }
 
     /**
@@ -1134,7 +1448,18 @@ CRITICAL: After each tool result, immediately decide on the next step and execut
      * Filter out JSON tool calls from content to show only natural language
      */
     private filterToolCallJSON(content: string): string {
-        // Remove JSON tool call patterns
+        // Remove JSON tool call patterns - handle nested JSON in arguments
+        // First try to find and remove complete JSON objects
+        const jsonMatch = this.parseJSONToolCallWithPosition(content);
+        if (jsonMatch && jsonMatch.toolCall) {
+            // Remove the JSON from the content
+            const before = content.substring(0, jsonMatch.start).trim();
+            const after = content.substring(jsonMatch.end).trim();
+            // Combine, removing any extra whitespace/newlines
+            return (before + ' ' + after).replace(/\s+/g, ' ').trim();
+        }
+
+        // Fallback: simple regex (may not handle nested JSON well)
         return content.replace(/\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{[^}]*\}\s*\}/g, '').trim();
     }
 
@@ -1202,14 +1527,52 @@ Now, please start over: Find the FastAPI file, read it, then add the endpoint.`;
             // Execute the tool via MCPTools
             const result = await this.mcpTools.executeTool(mcpToolCall);
 
+            // Large tool result eviction (Deep Agents feature)
+            // If result is too large, write it to a file and return a reference
+            let finalContent = result.content || '';
+            let wasEvicted = false;
+
+            if (result.success && finalContent.length > this.LARGE_RESULT_THRESHOLD) {
+                // Result is too large - evict it to a file
+                const cacheKey = `tool_result_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+                const evictionFilePath = `.easycode_cache/${cacheKey}.txt`;
+
+                try {
+                    // Write large result to cache file
+                    const fs = require('fs');
+                    const vscode = require('vscode');
+                    // Get workspace root
+                    const workspaceFolders = vscode.workspace.workspaceFolders;
+                    const workspaceRoot = workspaceFolders?.[0]?.uri.fsPath || process.cwd();
+                    const cacheDir = path.join(workspaceRoot, '.easycode_cache');
+                    if (!fs.existsSync(cacheDir)) {
+                        fs.mkdirSync(cacheDir, { recursive: true });
+                    }
+                    const fullPath = path.join(cacheDir, `${cacheKey}.txt`);
+                    fs.writeFileSync(fullPath, finalContent, 'utf-8');
+
+                    // Store reference in cache
+                    this.toolResultCache.set(cacheKey, fullPath);
+
+                    // Replace content with concise reference
+                    const originalLength = finalContent.length;
+                    finalContent = `[Large result evicted to file: ${evictionFilePath}]\n\nResult preview (first 1000 chars):\n${finalContent.substring(0, 1000)}...\n\nTo read the full result, use: read_file("${evictionFilePath}")`;
+                    wasEvicted = true;
+                    onMessage('system', `💾 Large tool result (${Math.round(originalLength / 1000)}k chars) evicted to ${evictionFilePath} to save context space.`);
+                } catch (evictionError: any) {
+                    // If eviction fails, continue with full content
+                    console.warn('Failed to evict large tool result:', evictionError);
+                }
+            }
+
             const toolResult: ToolResult = {
                 success: result.success,
-                content: result.content || '',
+                content: finalContent,
                 error: result.error
             };
 
             onToolExecution(mcpToolCall, toolResult);
-            onProgress(`✅ Completed: ${toolCall.name}`);
+            onProgress(`✅ Completed: ${toolCall.name}${wasEvicted ? ' (large result evicted)' : ''}`);
 
             // Update state tracking (before checking results)
             this.updateState(mcpToolCall, toolResult);
@@ -1233,27 +1596,23 @@ Now, please start over: Find the FastAPI file, read it, then add the endpoint.`;
 
             // Show result to user with intelligent guidance
             if (result.success) {
-                // Intelligent guidance based on action type and state
-                if (toolCall.name === 'read_file' && result.content) {
-                    // Provide guidance based on file reading
+                // Natural, conversational feedback (like Cursor/Copilot)
+                if (toolCall.name === 'analyze_code' && result.content) {
                     const filePath = toolCall.arguments.file_path;
-                    if (this.codebaseState.filesRead.has(filePath)) {
-                        onMessage('system', `✅ File read: ${filePath} (already read previously)`);
-                    } else {
-                        onMessage('system', `✅ File read: ${filePath}`);
-                    }
-                    onMessage('system', '💡 File content retrieved. Analyze it and use the appropriate editing tools to make changes.');
+                    onMessage('system', `✅ Analyzed ${filePath}`);
+                    // If duplicates detected, the analyze_code tool already includes this in its output
+                } else if (toolCall.name === 'read_file') {
+                    const filePath = toolCall.arguments.file_path;
+                    onMessage('system', `✅ Read ${filePath}`);
                 } else if (toolCall.name === 'list_files') {
-                    onMessage('system', '✅ Files listed successfully');
-                    onMessage('system', '💡 Files listed. Consider reading relevant files to understand the codebase structure.');
-                } else if (['insert_code', 'replace_code', 'search_replace'].includes(toolCall.name)) {
+                    onMessage('system', '✅ Files listed');
+                } else if (['insert_code', 'replace_code', 'search_replace', 'write_file'].includes(toolCall.name)) {
                     const filePath = toolCall.arguments.file_path;
-                    onMessage('system', `✅ File modified: ${filePath}`);
-                    onMessage('system', '💡 File modified. Consider using validate_syntax to verify the changes are valid.');
+                    onMessage('system', `✅ Updated ${filePath}`);
                 } else if (toolCall.name === 'run_command') {
-                    onMessage('system', `✅ Command executed: ${toolCall.arguments.command.substring(0, 50)}...`);
+                    onMessage('system', `✅ Command executed`);
                 } else {
-                    onMessage('system', `✅ ${toolCall.name} executed successfully`);
+                    onMessage('system', `✅ ${toolCall.name} completed`);
                 }
             } else {
                 onMessage('system', `❌ ${toolCall.name} failed: ${result.error || 'Unknown error'}`);
@@ -1361,23 +1720,51 @@ Now, please start over: Find the FastAPI file, read it, then add the endpoint.`;
     }
 
     /**
+     * Get a normalized action key for loop detection
+     */
+    private getActionKey(action: string): string {
+        // Normalize action strings for comparison
+        // Extract tool name from action string (e.g., "read_file(file_path: ...)" -> "read_file")
+        const match = action.match(/^([a-z_]+)/);
+        return match ? match[1] : action;
+    }
+
+    /**
      * Detect if agent is stuck in a loop
      */
     private detectLoop(): boolean {
-        if (this.recentActions.length < 3) return false;
+        // More lenient loop detection - allow exploration
+        if (this.recentActions.length < 5) return false;
 
-        // Check for repeated actions
-        const lastActions = this.recentActions.slice(-5).map(a => a.action);
-        const uniqueActions = new Set(lastActions);
+        const lastActions = this.recentActions.slice(-5);
+        const actionKeys = lastActions.map(a => this.getActionKey(a.action));
 
-        // If we have very few unique actions, might be looping
-        if (uniqueActions.size <= 2 && lastActions.length >= 5) {
+        // Check for immediate repetition (same action 4+ times in a row)
+        const uniqueActions = new Set(actionKeys.slice(-4));
+        if (uniqueActions.size === 1) {
+            // Same action 4+ times in a row - likely a loop
             return true;
         }
 
-        // Check for A->B->A pattern
-        if (lastActions.length >= 3) {
-            const [a, b, c] = lastActions.slice(-3);
+        // Check for A->B->A->B pattern (oscillating between two actions)
+        if (actionKeys.length >= 4) {
+            const pattern = actionKeys.slice(-4);
+            if (pattern[0] === pattern[2] && pattern[1] === pattern[3] && pattern[0] !== pattern[1]) {
+                return true;
+            }
+        }
+
+        // Allow list_files and read_file to repeat a few times during exploration
+        // But if we're doing the same read_file multiple times without making changes, that's a loop
+        const readFileCount = actionKeys.filter(k => k === 'read_file').length;
+        if (readFileCount >= 3 && this.codebaseState.filesModified.size === 0 && actionKeys.length >= 4) {
+            // Reading files multiple times without making changes - likely stuck
+            return true;
+        }
+
+        // Check for A->B->A pattern (simpler oscillation)
+        if (actionKeys.length >= 3) {
+            const [a, b, c] = actionKeys.slice(-3);
             if (a === c && a !== b) {
                 return true;
             }
@@ -1391,6 +1778,21 @@ Now, please start over: Find the FastAPI file, read it, then add the endpoint.`;
      */
     private async checkTaskCompletion(task: string): Promise<{ complete: boolean; summary: string }> {
         const taskLower = task.toLowerCase();
+
+        // For "remove" or "fix" tasks, we need to ensure the file was actually modified
+        if (taskLower.includes('remove') || taskLower.includes('delete') || taskLower.includes('fix') || taskLower.includes('duplicate')) {
+            // Don't mark as complete unless we've actually modified files
+            if (this.codebaseState.filesModified.size === 0) {
+                return { complete: false, summary: 'Task not complete: No files modified yet. Please make the requested changes immediately.' };
+            }
+            // If we modified files, check if we're done
+            if (this.codebaseState.filesModified.size > 0 && this.codebaseState.errors.length === 0) {
+                return {
+                    complete: true,
+                    summary: `Task appears complete: ${this.codebaseState.filesModified.size} file(s) modified successfully.`
+                };
+            }
+        }
 
         // Check for common completion indicators
         if (taskLower.includes('add') || taskLower.includes('create')) {
@@ -1415,6 +1817,181 @@ Now, please start over: Find the FastAPI file, read it, then add the endpoint.`;
     }
 
     /**
+     * Estimate token count (rough approximation: 1 token ≈ 4 characters)
+     */
+    private estimateTokens(text: string): number {
+        // Rough approximation: 1 token ≈ 4 characters
+        return Math.ceil(text.length / 4);
+    }
+
+    /**
+     * Summarize old conversation history (Deep Agents feature)
+     * Keeps recent messages intact, summarizes older ones
+     */
+    private async summarizeConversationHistory(
+        messages: any[],
+        onMessage: (role: string, content: string) => void
+    ): Promise<void> {
+        if (messages.length <= this.MAX_MESSAGES_BEFORE_SUMMARIZATION) {
+            return;
+        }
+
+        // Keep the most recent messages intact
+        const recentMessages = messages.slice(-this.MESSAGES_TO_KEEP_INTACT);
+        const oldMessages = messages.slice(0, messages.length - this.MESSAGES_TO_KEEP_INTACT);
+
+        // Summarize old messages
+        // Note: In a production Deep Agents setup, this would call the LLM to create a proper summary
+        // For now, we use a simple truncation approach to prevent context window saturation
+        try {
+            // Extract key information from old messages for a concise summary
+            const keyInfo: string[] = [];
+            oldMessages.forEach((msg) => {
+                const role = msg.getType ? msg.getType() : (msg.role || 'unknown');
+                const content = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
+
+                // Extract tool calls
+                if (role === 'ai' && (msg as any).tool_calls) {
+                    const toolCalls = (msg as any).tool_calls || [];
+                    toolCalls.forEach((tc: any) => {
+                        if (tc.name) keyInfo.push(`Tool: ${tc.name}(${JSON.stringify(tc.args || {}).substring(0, 100)})`);
+                    });
+                }
+
+                // Extract file operations from tool messages
+                if (role === 'tool' && content.includes('file')) {
+                    const fileMatch = content.match(/(read|write|edit|analyze).*?['"]([^'"]+)['"]/i);
+                    if (fileMatch) {
+                        keyInfo.push(`File operation: ${fileMatch[1]} ${fileMatch[2]}`);
+                    }
+                }
+            });
+
+            // Create a summary message
+            const summaryLines = keyInfo.length > 0
+                ? keyInfo.slice(0, 10).join('\n') // Keep top 10 key items
+                : `${oldMessages.length} messages from earlier conversation`;
+            const summaryContent = `[Previous conversation summarized: ${oldMessages.length} messages compressed]\n\nKey actions from earlier conversation:\n${summaryLines}\n\n[Recent conversation continues below...]`;
+            const SystemMessageClass = this.getSystemMessageClass();
+            const summaryMessage = new SystemMessageClass(summaryContent);
+
+            // Replace old messages with summary
+            messages.splice(0, oldMessages.length, summaryMessage);
+
+            onMessage('system', `💾 Compressed ${oldMessages.length} old messages to save context space.`);
+        } catch (error: any) {
+            // If summarization fails, just truncate old messages
+            console.warn('Failed to summarize conversation history:', error);
+            messages.splice(0, oldMessages.length);
+        }
+    }
+
+    /**
+     * Execute a task using a subagent (Deep Agents feature)
+     * Subagents work in isolated context and return concise results
+     */
+    private async executeSubagentTask(subagentName: string, task: string): Promise<string> {
+        // Find the subagent
+        const subagent = this.subagents.get(subagentName);
+        if (!subagent) {
+            return `Error: Subagent "${subagentName}" not found. Available subagents: ${Array.from(this.subagents.keys()).join(', ')}`;
+        }
+
+        try {
+            // Create an isolated orchestrator instance for the subagent
+            // This ensures context isolation - the subagent's work doesn't clutter the main agent's context
+            const subagentOrchestrator = new LangChainOrchestrator(
+                this.mcpTools,
+                subagent.model || this.currentModel,
+                this.currentUrl
+            );
+
+            // Configure subagent with its specific tools if specified
+            // For now, we'll use all tools (can be optimized later to filter by subagent.tools)
+
+            // Build system prompt for subagent
+            const subagentSystemPrompt = `${subagent.systemPrompt}
+
+IMPORTANT: 
+- Work independently and complete the task
+- Return a concise summary of your work, not raw data or intermediate results
+- Keep your response focused and actionable
+- Do NOT include detailed tool outputs or intermediate steps in your final response`;
+
+            // Execute the task in isolated context
+            // We'll use a simplified execution that captures the final result
+            let finalResult = '';
+            let executionError: string | null = null;
+
+            await subagentOrchestrator.orchestrate(
+                task,
+                subagentSystemPrompt,
+                subagent.model || this.currentModel,
+                this.currentUrl,
+                (progress) => {
+                    // Progress updates from subagent (can be logged but not shown to main agent)
+                    console.log(`[Subagent ${subagentName}] ${progress}`);
+                },
+                (toolCall, result) => {
+                    // Tool executions from subagent (isolated, not shown to main agent)
+                    console.log(`[Subagent ${subagentName}] Tool: ${toolCall.name}`);
+                },
+                (role, content) => {
+                    // Messages from subagent - capture the final assistant message as the result
+                    // Note: We overwrite finalResult each time to get the latest message
+                    // (The orchestrator uses updateLastAssistantMessage which updates the same message)
+                    if (role === 'assistant') {
+                        finalResult = content; // Always use the latest assistant message
+                    }
+                    if (role === 'system' && content.includes('❌')) {
+                        executionError = content;
+                    }
+                }
+            );
+
+            // Return concise result to main agent
+            if (executionError) {
+                return `Subagent "${subagentName}" encountered an error: ${executionError}\n\nTask: ${task}`;
+            }
+
+            if (!finalResult || finalResult.trim().length === 0) {
+                return `Subagent "${subagentName}" completed the task but returned no result.\n\nTask: ${task}`;
+            }
+
+            // Ensure the result is concise (subagents should return summaries, not raw data)
+            const maxResultLength = 2000; // Keep subagent results concise
+            if (finalResult.length > maxResultLength) {
+                return `Subagent "${subagentName}" completed the task. Summary:\n\n${finalResult.substring(0, maxResultLength)}...\n\n[Result truncated - subagent returned ${finalResult.length} characters]`;
+            }
+
+            return `Subagent "${subagentName}" completed the task:\n\n${finalResult}`;
+        } catch (error: any) {
+            return `Error executing subagent "${subagentName}": ${error.message}\n\nTask: ${task}`;
+        }
+    }
+
+    /**
+     * Add a custom subagent (for future extensibility)
+     */
+    public addSubagent(subagent: SubAgent): void {
+        if (subagent.name === this.GENERAL_PURPOSE_SUBAGENT_NAME) {
+            throw new Error(`Cannot override the built-in "${this.GENERAL_PURPOSE_SUBAGENT_NAME}" subagent`);
+        }
+        this.subagents.set(subagent.name, subagent);
+
+        // Update task tool description to include new subagent
+        // (In a more sophisticated implementation, we'd dynamically update the tool)
+        console.log(`Added subagent: ${subagent.name}`);
+    }
+
+    /**
+     * Get available subagents
+     */
+    public getSubagents(): SubAgent[] {
+        return Array.from(this.subagents.values());
+    }
+
+    /**
      * Reset state for new task
      */
     private resetState(): void {
@@ -1427,6 +2004,7 @@ Now, please start over: Find the FastAPI file, read it, then add the endpoint.`;
         };
         this.fileChanges = [];
         this.recentActions = [];
+        this.toolResultCache.clear();
     }
 
     /**

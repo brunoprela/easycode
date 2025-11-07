@@ -100,3 +100,20 @@ export interface ChatMessage {
     timestamp?: string;
 }
 
+// Subagent types (Deep Agents inspired)
+export interface SubAgent {
+    name: string;
+    description: string;
+    systemPrompt: string;
+    tools?: string[]; // Tool names this subagent can use (empty = all tools)
+    model?: string; // Optional model override
+}
+
+export interface SubAgentResult {
+    success: boolean;
+    content: string;
+    error?: string;
+    subagentName: string;
+    task: string;
+}
+

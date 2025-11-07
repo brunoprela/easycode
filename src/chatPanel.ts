@@ -1,7 +1,6 @@
 import * as vscode from 'vscode';
 import { MCPTools } from './mcpTools';
 import { AdvancedOrchestrator } from './orchestration/orchestrator';
-import { ReActOrchestrator } from './orchestration/reactOrchestrator';
 import { LangChainOrchestrator } from './orchestration/langchainOrchestrator';
 import { MCPToolAdapter } from './orchestration/mcpToolAdapter';
 import { getWebviewHtml } from './webviewContent';
@@ -17,10 +16,8 @@ export class ChatPanel {
     private _currentModel: string = '';
     private _mcpTools: MCPTools;
     private _orchestrator: AdvancedOrchestrator;
-    private _reactOrchestrator: ReActOrchestrator;
     private _langchainOrchestrator: LangChainOrchestrator | null = null;
     private _useLangChain: boolean = true; // Use LangChain orchestrator
-    private _useReAct: boolean = false; // Fallback only
     private _messageHandlers: MessageHandlers;
 
 
@@ -29,7 +26,6 @@ export class ChatPanel {
         this._extensionUri = extensionUri;
         this._mcpTools = new MCPTools();
         this._orchestrator = new AdvancedOrchestrator(this._mcpTools);
-        this._reactOrchestrator = new ReActOrchestrator(this._mcpTools);
         // LangChain orchestrator will be initialized lazily with model/URL
 
         // Set the webview's initial html content
@@ -250,32 +246,9 @@ REMEMBER:
                     );
                 } catch (langchainError: any) {
                     console.error('LangChain orchestrator error:', langchainError);
-                    // Fallback to ReAct orchestrator
-                    this._useLangChain = false;
-                    this._useReAct = true;
-                    messageCallback('system', `⚠️ LangChain error: ${langchainError.message}. Falling back to ReAct orchestrator.`);
-
-                    await this._reactOrchestrator.orchestrate(
-                        text,
-                        systemMessage,
-                        model,
-                        this._ollamaUrl,
-                        progressCallback,
-                        toolExecutionCallback,
-                        messageCallback
-                    );
+                    messageCallback('system', `❌ LangChain error: ${langchainError.message}. Please try again or check your Ollama connection.`);
+                    throw langchainError;
                 }
-            } else if (this._useReAct) {
-                // Use ReAct orchestrator
-                await this._reactOrchestrator.orchestrate(
-                    text,
-                    systemMessage,
-                    model,
-                    this._ollamaUrl,
-                    progressCallback,
-                    toolExecutionCallback,
-                    messageCallback
-                );
             } else {
                 // Fallback to advanced orchestrator
                 await this._orchestrator.orchestrate(
